@@ -11,6 +11,24 @@ Usage:
   python3 ftd_acl_packettrace_audit.py
   ACL_PT_PRINT_MODE=verbose python3 ftd_acl_packettrace_audit.py
   ACL_PT_COLOR=0 python3 ftd_acl_packettrace_audit.py
+
+DISCLAIMER
+
+This tool is provided “AS IS”, without warranty of any kind, express or implied,
+including but not limited to the warranties of merchantability, fitness for a
+particular purpose, and non-infringement. The authors and contributors shall not
+be liable for any claim, damages, or other liability, whether in an action of
+contract, tort, or otherwise, arising from, out of, or in connection with the
+software or the use of or other dealings in the software. By using this tool,
+you accept these terms. 
+
+Operational caveats:
+- Results are best-effort simulations driven by device CLI outputs
+  (e.g., `packet-tracer`, routing tables, object/object-group definitions) and
+  may differ from live traffic due to NAT, prefilter, policy layers, or platform
+  differences.
+- Validate findings in a lab or maintenance window before acting on them.
+- Use only with proper authorization on systems you own or are permitted to test.
 """
 
 import re
