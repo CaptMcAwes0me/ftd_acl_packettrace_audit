@@ -109,7 +109,11 @@ Show each `packet-tracer` command and result:
 ```bash
 ACL_PT_PRINT_MODE=verbose python3 ftd_acl_packettrace_audit.py
 ```
-
+### 📝 Enable Logging (opt-in)
+Write per-ACE logs + CSV/JSONL to /var/tmp:
+```bash
+ACL_PT_LOG=1 python3 ftd_acl_packettrace_audit.py
+```
 Include `[DBG]` previews (routes, objects, etc.):
 ```bash
 ACL_PT_PRINT_MODE=debug python3 ftd_acl_packettrace_audit.py
