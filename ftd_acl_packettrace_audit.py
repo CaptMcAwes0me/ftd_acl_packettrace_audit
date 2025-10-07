@@ -145,7 +145,7 @@ def parse_acl_and_test():
         return
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = f"/var/log/acl_packet_tracer_{ts}"
+    log_dir = f"/var/tmp/acl_packet_tracer_{ts}"
     os.makedirs(log_dir, exist_ok=True)
     global LOG_DIR_GLOBAL
     LOG_DIR_GLOBAL = log_dir
