@@ -67,6 +67,12 @@ SERVICE_NAME_TO_PORT = {
     "snmptrap": 162, "snmp-trap": 162,
 }
 
+# -------- Logging controls (opt-in) --------
+# Enable all on-disk logging (per-rule packet-tracer logs + CSV/JSONL) only when set.
+LOG_ENABLED  = os.environ.get("ACL_PT_LOG", "0").strip().lower() in ("1", "true", "yes", "on")
+# Base directory for logs when LOG_ENABLED=1
+LOG_DIR_BASE = (os.environ.get("ACL_PT_LOG_DIR", "/var/tmp").strip() or "/var/tmp")
+
 # -------- Output controls --------
 PRINT_MODE = os.environ.get("ACL_PT_PRINT_MODE", "summary").strip().lower()  # summary | verbose | debug
 USE_COLOR  = os.environ.get("ACL_PT_COLOR", "1").strip() != "0"
@@ -163,10 +169,18 @@ def parse_acl_and_test():
         return
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = f"/var/tmp/acl_packet_tracer_{ts}"
-    os.makedirs(log_dir, exist_ok=True)
+
+    # Only create a run directory if logging is enabled
+    if LOG_ENABLED:
+        log_dir = os.path.join(LOG_DIR_BASE, f"acl_packet_tracer_{ts}")
+        os.makedirs(log_dir, exist_ok=True)
+        print(DIM(f"[logging enabled] run dir: {log_dir}"))
+    else:
+        log_dir = None
+        print(DIM("[logging disabled] no packet-tracer output or summaries will be written"))
+
     global LOG_DIR_GLOBAL
-    LOG_DIR_GLOBAL = log_dir
+    LOG_DIR_GLOBAL = log_dir  # may be None when logging disabled
 
     for line in acl_lines:
         print(f"\nProcessing rule:\n{line}")
@@ -787,13 +801,17 @@ def _debug_show_route(src_ips_subset):
 # Logging summaries
 # =========================
 def _write_rule_log(rule_id, cmd, result, out, log_dir):
+    # No-op unless logging is enabled
+    if not LOG_ENABLED or not log_dir:
+        return
     with open(os.path.join(log_dir, f"rule_{rule_id}.log"), "a") as f:
         f.write(f"\nCOMMAND: {cmd}\nRESULT: {result}\n{out}\n{'-'*60}\n")
 
+
 def _write_global_summaries():
-    if not LOG_DIR_GLOBAL or not RESULTS:
+    # No-op unless logging is enabled
+    if not LOG_ENABLED or not LOG_DIR_GLOBAL or not RESULTS:
         return
-    # CSV
     try:
         import csv
         csv_path = os.path.join(LOG_DIR_GLOBAL, "summary.csv")
@@ -808,7 +826,6 @@ def _write_global_summaries():
     except Exception as e:
         _dbg(f"[DBG] CSV write error: {e}")
 
-    # JSONL
     try:
         import json
         j_path = os.path.join(LOG_DIR_GLOBAL, "summary.jsonl")
@@ -818,6 +835,7 @@ def _write_global_summaries():
         print(DIM(f"Summary JSONL: {j_path}"))
     except Exception as e:
         _dbg(f"[DBG] JSONL write error: {e}")
+
 
 # =========================
 # Main
