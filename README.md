@@ -114,6 +114,10 @@ Write per-ACE logs + CSV/JSONL to /var/tmp:
 ```bash
 ACL_PT_LOG=1 python3 ftd_acl_packettrace_audit.py
 ```
+Choose a custom directory:
+```bash
+ACL_PT_LOG=1 ACL_PT_LOG_DIR=/var/tmp/ftd_audit_runs python3 ftd_acl_packettrace_audit.py
+```
 Include `[DBG]` previews (routes, objects, etc.):
 ```bash
 ACL_PT_PRINT_MODE=debug python3 ftd_acl_packettrace_audit.py
@@ -204,6 +208,7 @@ TEST_FIRST_PORT_ONLY = True  # set to False to test all resolved ports
 | `ACL_PT_COLOR` | 1 or 0 | 1 | Enable/disable ANSI colors |
 | `ACL_PT_MAX_FLAG_PRINT` | integer | 100 | Limit flagged lines printed per rule |
 | `ACL_PT_DEFAULT_IF` | string (ifname) | *(empty)* | Fallback ingress if route parsing fails |
+| `ACL_PT_LOG` | 1 or 0 | 0 | Write per-ACE logs + CSV/JSONL to /var/tmp |
 
 ---
 
