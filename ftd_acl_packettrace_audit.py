@@ -541,31 +541,18 @@ def parse_route_for_interface(route_txt: str) -> Optional[str]:
 # =========================
 # Packet-tracer result parsing
 # =========================
-def extract_pt_result(out: str) -> str:
-    """
-    Return 'ALLOW', 'DENY', or 'UNKNOWN' from packet-tracer output.
-    Prefer the summary 'Action:' line. If absent, use the last 'Result:'.
-    """
-    # 1) Strongest signal: summary Action
-    m = re.search(r'^\s*Action:\s*(\w+)', out, re.IGNORECASE | re.MULTILINE)
+def extract_pt_result(output: str) -> str:
+    # Case-insensitive match for common summary fields
+    m = re.search(r'(?im)^\s*(result|action|status)\s*:\s*([A-Z]+)\b', output)
     if m:
-        action = m.group(1).strip().lower()
-        if action.startswith('allow'):
-            return "ALLOW"
-        # treat anything else (drop/deny) as DENY
-        return "DENY"
+        return m.group(2).upper()
 
-    # 2) Fallback: last Phase Result
-    results = re.findall(r'^\s*Result:\s*([A-Z]+)', out, re.IGNORECASE | re.MULTILINE)
-    if results:
-        last = results[-1].upper()
-        if last == "ALLOW":
-            return "ALLOW"
-        if last in ("DROP", "DENY", "BLOCK"):
-            return "DENY"
-
-    # 3) Heuristic: presence of Drop-reason implies denial
-    if re.search(r'^\s*Drop-reason:', out, re.IGNORECASE | re.MULTILINE):
+    # Fallback: scan for obvious tokens if the summary field isn't present
+    if re.search(r'(?i)\ballow(ed)?\b', output):
+        return "ALLOW"
+    if re.search(r'(?i)\bpermi(t|tted)\b', output):
+        return "ALLOW"
+    if re.search(r'(?i)\bdeny(ied)?\b|\bdrop(ped)?\b', output):
         return "DENY"
 
     return "UNKNOWN"
@@ -595,6 +582,20 @@ def parse_pt_acl_hits(output):
 
     return hits
 
+def extract_drop_reason(out: str):
+    """
+    Parse the packet-tracer 'Drop-reason:' line.
+    Returns the short reason code (e.g., 'sp-security-failed') or None.
+    """
+    m = re.search(r'^\s*Drop-reason:\s*\(([^)]+)\)\s*(.*)$',
+                  out, re.IGNORECASE | re.MULTILINE)
+    if not m:
+        return None
+    code = m.group(1).strip()
+    # Optional: also capture a brief description if you want later:
+    # desc = re.split(r'\bDrop-location:\b', m.group(2))[0].strip().strip(',')
+    return code or None
+
 def map_ruleid_to_line(acl_name, rule_id):
     """Map rule-id -> ACL line number by parsing 'show access-list <acl_name>' (cached)."""
     key = (acl_name, rule_id)
@@ -611,83 +612,136 @@ def map_ruleid_to_line(acl_name, rule_id):
 
     return ACL_LINE_CACHE.get(key)
 
-def determine_ace_match(rule: dict, out: str) -> dict:
+def determine_ace_match(rule, pt_output):
     """
-    Try to identify which ACE matched by inspecting the ACCESS-LIST phase 'Config:' block.
-    Returns:
-      {
-        "matched": True/False/None,   # True if this rule_id appears as the hit
-        "hit": {"acl": str, "action": "permit"/"deny", "rule_id": str} or None
-      }
+    Decide if THIS rule matched based on packet-tracer output.
+      1) Prefer a direct rule-id match in PT output.
+      2) Else, if PT shows a line number, compare to our line for this rule-id.
+      3) Otherwise, unknown.
+    Returns dict: {'matched': True/False/None, 'hit': <dict or None>, 'expected_line': <int or None>}
     """
-    # Narrow to Phase 3 ACCESS-LIST block if present
-    phase = re.search(r'Phase:\s*3.*?ACCESS-LIST(.*?)(?:\nPhase:\s*\d+|\Z)',
-                      out, re.IGNORECASE | re.DOTALL)
-    block = phase.group(1) if phase else out
+    hits = parse_pt_acl_hits(pt_output)
+    if not hits:
+        return {"matched": None, "hit": None, "expected_line": None}
 
-    # Look for the first access-list line that includes a rule-id
-    # Example: access-list CSM_FW_ACL_ advanced deny ip any any rule-id 268436833 ...
-    m = re.search(
-        r'access-list\s+(\S+).*?\s(permit|deny)\s+\S+.*?rule-id\s+(\d+)',
-        block, re.IGNORECASE | re.DOTALL
-    )
+    # 1) Direct rule-id match
+    for h in hits:
+        if h.get("rule_id") and h["acl"] == rule["acl_name"] and h["rule_id"] == rule["rule_id"]:
+            return {"matched": True, "hit": h, "expected_line": None}
 
-    hit = None
-    if m:
-        hit = {
-            "acl": m.group(1),
-            "action": m.group(2).lower(),
-            "rule_id": m.group(3)
-        }
+    # 2) Fallback to line-number comparison
+    expected_line = map_ruleid_to_line(rule["acl_name"], rule["rule_id"])
+    if expected_line is not None:
+        for h in hits:
+            if h.get("line") is not None and h["acl"] == rule["acl_name"] and h["line"] == expected_line:
+                return {"matched": True, "hit": h, "expected_line": expected_line}
+        # PT hit exists but not our line → different ACE on same ACL
+        return {"matched": False, "hit": hits[0], "expected_line": expected_line}
 
-    matched = None
-    if hit:
-        matched = (str(rule.get("rule_id")) == hit["rule_id"])
-    return {"matched": matched, "hit": hit}
+    # 3) We saw a hit but couldn’t confirm it’s ours (no rule-id and no line map)
+    return {"matched": None, "hit": hits[0], "expected_line": None}
 
 # =========================
 # Packet-tracer runner (clean output)
 # =========================
 def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, log_dir):
-    executed = []  # list of dicts for this rule
-    proto = (rule['proto'] or "").lower()
-    max_flag_print = int(os.environ.get("ACL_PT_MAX_FLAG_PRINT", "100"))  # cap flagged prints if desired
+    """
+    Execute packet-tracer probes for the given rule and print a compact summary.
+    - ICMP syntax: packet-tracer input <if> icmp <src> 8 0 <dst>
+    - TCP/UDP:     packet-tracer input <if> <proto> <src> 12345 <dst> <dport>
+
+    Behavior:
+      • Final outcome is taken from the last 'Action:' line (ALLOW/DROP). If absent, we fall back to phase Results.
+      • For non-ALLOW outcomes (e.g., adjacency/NAT/prefilter issues), we still show whether the ACL phase
+        matched THIS ACE or a DIFFERENT ACE and which action that ACL phase took (PERMIT/DENY).
+      • When dropped, append the short drop reason code in brackets, e.g. [no-v4-adjacency].
+    """
+    executed = []  # rows for this rule only
+    proto = (rule.get("proto") or "").lower()
+
+    def _final_action(out: str):
+        """Return 'allow' or 'drop' if an Action line is present; otherwise None."""
+        import re
+        acts = re.findall(r'Action:\s*(\w+)', out, re.IGNORECASE)
+        return acts[-1].lower() if acts else None
+
+    def _drop_reason(out: str):
+        """Parse the last Drop-reason short code, e.g., 'sp-security-failed'."""
+        import re
+        reasons = re.findall(r'^\s*Drop-reason:\s*\(([^)]+)\)', out, re.IGNORECASE | re.MULTILINE)
+        return reasons[-1].strip() if reasons else None
+
+    def _append_acl_phase_annotation(label: str, match_info: dict, final_is_allow: bool) -> str:
+        """
+        Append ACL-phase context. For ALLOW (final), we keep the previous behavior.
+        For non-ALLOW final outcomes, we still indicate whether ACL phase permitted/denied and which ACE.
+        """
+        hit = match_info.get("hit")
+        matched = match_info.get("matched")
+
+        if final_is_allow:
+            if matched is True:
+                return label + " (matched this ACE)"
+            if matched is False and hit:
+                if hit.get("rule_id"):
+                    return label + f" (by {hit['acl']} rule-id {hit['rule_id']})"
+                if hit.get("line") is not None:
+                    return label + f" (by {hit['acl']} line {hit['line']})"
+            return label
+
+        # Non-ALLOW final outcome → include ACL-phase details if available
+        if hit:
+            acl_phase = hit.get("action", "").upper()  # 'permit'/'deny' from ACCESS-LIST phase
+            if matched is True:
+                return label + f" ; ACL phase: {acl_phase or 'UNKNOWN'} (matched this ACE)"
+            else:
+                if hit.get("rule_id"):
+                    return label + f" ; ACL phase: {acl_phase or 'UNKNOWN'} (by {hit['acl']} rule-id {hit['rule_id']})"
+                if hit.get("line") is not None:
+                    return label + f" ; ACL phase: {acl_phase or 'UNKNOWN'} (by {hit['acl']} line {hit['line']})"
+        return label
 
     def get_ingress_for_src(src_ip):
+        # Prefer explicit interface on the ACE; otherwise per-source route lookup (with caching)
         if rule.get("src_if"):
             return rule["src_if"]
         if src_ip in ROUTE_IF_CACHE:
             return ROUTE_IF_CACHE[src_ip]
         ifname = find_ingress_interface(src_ip)
+        # Sometimes the route text literally shows "(interface)" — treat as unknown
         if ifname and ifname.lower() == "interface":
             ifname = None
         ROUTE_IF_CACHE[src_ip] = ifname
         return ifname
 
-    for src_ip in src_ips:
+    max_flag_print = int(os.environ.get("ACL_PT_MAX_FLAG_PRINT", "100"))
+
+    for src_ip in (src_ips or []):
         src_ingress = get_ingress_for_src(src_ip)
         if not src_ingress:
             print(f"  [WARN] Skipping src {src_ip} (could not determine ingress interface).")
             _debug_show_route([src_ip])
             continue
 
-        for dst_ip in dst_ips:
+        for dst_ip in (dst_ips or []):
             if proto.startswith("icmp"):
-                # Correct order: <src_ip> <type> <code> <dst_ip>
-                cmd = f"packet-tracer input {src_ingress} icmp {src_ip} {ICMP_TYPE_DEFAULT} {ICMP_CODE_DEFAULT} {dst_ip}"
+                # ICMP echo-request (type 8, code 0) order: <src> <type> <code> <dst>
+                cmd = f"packet-tracer input {src_ingress} icmp {src_ip} 8 0 {dst_ip}"
                 out = get_and_parse_cli_output(cmd)
-                result = extract_pt_result(out)
+
+                # Final action first; fallback parser if needed
+                fa = _final_action(out)
+                result = "ALLOW" if (fa and fa.startswith("allow")) else ("DENY" if fa else extract_pt_result(out))
 
                 match_info = determine_ace_match(rule, out)
+
+                # Build label
                 label = result
-                if match_info["matched"] is True:
-                    label += " (matched this ACE)"
-                elif match_info["matched"] is False and match_info["hit"]:
-                    h = match_info["hit"]
-                    if h.get("rule_id"):
-                        label += f" (by {h['acl']} rule-id {h['rule_id']})"
-                    elif h.get("line") is not None:
-                        label += f" (by {h['acl']} line {h['line']})"
+                if result.upper() == "DENY":
+                    dr = _drop_reason(out)
+                    if dr:
+                        label += f" [{dr}]"
+                label = _append_acl_phase_annotation(label, match_info, final_is_allow=(result.upper()=="ALLOW"))
 
                 row = {
                     "acl": rule["acl_name"], "rule_id": rule["rule_id"], "proto": "icmp",
@@ -696,7 +750,8 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
                     "matched": match_info["matched"], "label": label,
                     "cmd": cmd,
                 }
-                executed.append(row); RESULTS.append({**row})
+                executed.append(row)
+                RESULTS.append({**row})
                 _write_rule_log(rule['rule_id'], cmd, label, out, log_dir)
 
                 if _is_verbose():
@@ -707,6 +762,7 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
                     print(preview)
 
             else:
+                # Determine destination ports to test
                 if ports:
                     dports = [ports[0]] if TEST_FIRST_PORT_ONLY else ports
                 else:
@@ -717,18 +773,18 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
                 for dport in dports:
                     cmd = f"packet-tracer input {src_ingress} {proto} {src_ip} 12345 {dst_ip} {dport}"
                     out = get_and_parse_cli_output(cmd)
-                    result = extract_pt_result(out)
+
+                    fa = _final_action(out)
+                    result = "ALLOW" if (fa and fa.startswith("allow")) else ("DENY" if fa else extract_pt_result(out))
 
                     match_info = determine_ace_match(rule, out)
+
                     label = result
-                    if match_info["matched"] is True:
-                        label += " (matched this ACE)"
-                    elif match_info["matched"] is False and match_info["hit"]:
-                        h = match_info["hit"]
-                        if h.get("rule_id"):
-                            label += f" (by {h['acl']} rule-id {h['rule_id']})"
-                        elif h.get("line") is not None:
-                            label += f" (by {h['acl']} line {h['line']})"
+                    if result.upper() == "DENY":
+                        dr = _drop_reason(out)
+                        if dr:
+                            label += f" [{dr}]"
+                    label = _append_acl_phase_annotation(label, match_info, final_is_allow=(result.upper()=="ALLOW"))
 
                     row = {
                         "acl": rule["acl_name"], "rule_id": rule["rule_id"], "proto": proto,
@@ -737,13 +793,14 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
                         "matched": match_info["matched"], "label": label,
                         "cmd": cmd,
                     }
-                    executed.append(row); RESULTS.append({**row})
+                    executed.append(row)
+                    RESULTS.append({**row})
                     _write_rule_log(rule['rule_id'], cmd, label, out, log_dir)
 
                     if _is_verbose():
                         print(f"   {cmd}  →  {label}")
 
-    # ---- Per-rule summary (compact) ----
+    # ---- Per-rule summary ----
     if not executed:
         print(f"\n[Summary for rule {rule['rule_id']}] (no tests)")
         print("-" * 60)
@@ -752,12 +809,12 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
     allow = sum(1 for r in executed if r["result"].upper() == "ALLOW")
     deny  = sum(1 for r in executed if r["result"].upper() == "DENY")
     unkn  = sum(1 for r in executed if r["result"].upper() == "UNKNOWN")
-    matched_allow = sum(1 for r in executed if r["result"].upper()=="ALLOW" and r["matched"] is True)
+    matched_allow = sum(1 for r in executed if r["result"].upper() == "ALLOW" and r["matched"] is True)
     other_allow   = allow - matched_allow
     ingress_set = sorted(set(r["ingress"] for r in executed if r.get("ingress")))
 
     ok = OK_TXT(str(matched_allow)) if matched_allow else "0"
-    y  = _c(str(other_allow), "33") if other_allow else "0"
+    y  = _c(str(other_allow), "33") if other_allow else "0"  # yellow
     x  = DEN_TXT(str(deny)) if deny else "0"
     q  = UNK_TXT(str(unkn)) if unkn else "0"
 
@@ -766,12 +823,11 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
     if _is_verbose():
         print(DIM(f"   acl={rule['acl_name']} srcs={len(src_ips or [])} dsts={len(dst_ips or [])}"))
 
-    # ---- Print flagged commands when any non-green outcomes exist ----
+    # ---- Print flagged commands (non-✅ or allowed by different ACE) ----
     flagged = [r for r in executed if (r["result"].upper() != "ALLOW") or (r["matched"] is not True)]
     if flagged:
         print(DIM("   Flagged packet-tracers:"))
         for r in flagged[:max_flag_print]:
-            # choose icon
             if r["result"].upper() == "DENY":
                 icon = "⛔"
             elif r["result"].upper() == "ALLOW" and r["matched"] is not True:
@@ -860,4 +916,3 @@ def _write_global_summaries():
 # =========================
 if __name__ == "__main__":
     parse_acl_and_test()
-
