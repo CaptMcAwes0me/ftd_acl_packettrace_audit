@@ -30,7 +30,7 @@ It then reports:
 ### 🚦 Per-Rule Summary with Icons
 - ✅ **ALLOW (matched this ACE)**
 - 🟡 **ALLOW (but a different ACE matched first)**
-- ⛔ **DENY**
+- ⛔ **DENY** — the packet-tracer’s final **Action** was *drop*. This can be an ACL decision (explicit deny or default rule) or another control (prefilter/security policy, NAT/routing, inspection/state, zone/interface). When available, the script shows the denying ACE (`rule-id`); otherwise check the `Drop-reason:` in the output.
 - ❓ **UNKNOWN (no clear result parsed)**
 
 ### 🧭 Per-Source Ingress Detection
