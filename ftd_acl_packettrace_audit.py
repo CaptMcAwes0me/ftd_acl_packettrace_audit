@@ -541,18 +541,31 @@ def parse_route_for_interface(route_txt: str) -> Optional[str]:
 # =========================
 # Packet-tracer result parsing
 # =========================
-def extract_pt_result(output: str) -> str:
-    # Case-insensitive match for common summary fields
-    m = re.search(r'(?im)^\s*(result|action|status)\s*:\s*([A-Z]+)\b', output)
+def extract_pt_result(out: str) -> str:
+    """
+    Return 'ALLOW', 'DENY', or 'UNKNOWN' from packet-tracer output.
+    Prefer the summary 'Action:' line. If absent, use the last 'Result:'.
+    """
+    # 1) Strongest signal: summary Action
+    m = re.search(r'^\s*Action:\s*(\w+)', out, re.IGNORECASE | re.MULTILINE)
     if m:
-        return m.group(2).upper()
+        action = m.group(1).strip().lower()
+        if action.startswith('allow'):
+            return "ALLOW"
+        # treat anything else (drop/deny) as DENY
+        return "DENY"
 
-    # Fallback: scan for obvious tokens if the summary field isn't present
-    if re.search(r'(?i)\ballow(ed)?\b', output):
-        return "ALLOW"
-    if re.search(r'(?i)\bpermi(t|tted)\b', output):
-        return "ALLOW"
-    if re.search(r'(?i)\bdeny(ied)?\b|\bdrop(ped)?\b', output):
+    # 2) Fallback: last Phase Result
+    results = re.findall(r'^\s*Result:\s*([A-Z]+)', out, re.IGNORECASE | re.MULTILINE)
+    if results:
+        last = results[-1].upper()
+        if last == "ALLOW":
+            return "ALLOW"
+        if last in ("DROP", "DENY", "BLOCK"):
+            return "DENY"
+
+    # 3) Heuristic: presence of Drop-reason implies denial
+    if re.search(r'^\s*Drop-reason:', out, re.IGNORECASE | re.MULTILINE):
         return "DENY"
 
     return "UNKNOWN"
@@ -598,34 +611,39 @@ def map_ruleid_to_line(acl_name, rule_id):
 
     return ACL_LINE_CACHE.get(key)
 
-def determine_ace_match(rule, pt_output):
+def determine_ace_match(rule: dict, out: str) -> dict:
     """
-    Decide if THIS rule matched based on packet-tracer output.
-      1) Prefer a direct rule-id match in PT output.
-      2) Else, if PT shows a line number, compare to our line for this rule-id.
-      3) Otherwise, unknown.
-    Returns dict: {'matched': True/False/None, 'hit': <dict or None>, 'expected_line': <int or None>}
+    Try to identify which ACE matched by inspecting the ACCESS-LIST phase 'Config:' block.
+    Returns:
+      {
+        "matched": True/False/None,   # True if this rule_id appears as the hit
+        "hit": {"acl": str, "action": "permit"/"deny", "rule_id": str} or None
+      }
     """
-    hits = parse_pt_acl_hits(pt_output)
-    if not hits:
-        return {"matched": None, "hit": None, "expected_line": None}
+    # Narrow to Phase 3 ACCESS-LIST block if present
+    phase = re.search(r'Phase:\s*3.*?ACCESS-LIST(.*?)(?:\nPhase:\s*\d+|\Z)',
+                      out, re.IGNORECASE | re.DOTALL)
+    block = phase.group(1) if phase else out
 
-    # 1) Direct rule-id match
-    for h in hits:
-        if h.get("rule_id") and h["acl"] == rule["acl_name"] and h["rule_id"] == rule["rule_id"]:
-            return {"matched": True, "hit": h, "expected_line": None}
+    # Look for the first access-list line that includes a rule-id
+    # Example: access-list CSM_FW_ACL_ advanced deny ip any any rule-id 268436833 ...
+    m = re.search(
+        r'access-list\s+(\S+).*?\s(permit|deny)\s+\S+.*?rule-id\s+(\d+)',
+        block, re.IGNORECASE | re.DOTALL
+    )
 
-    # 2) Fallback to line-number comparison
-    expected_line = map_ruleid_to_line(rule["acl_name"], rule["rule_id"])
-    if expected_line is not None:
-        for h in hits:
-            if h.get("line") is not None and h["acl"] == rule["acl_name"] and h["line"] == expected_line:
-                return {"matched": True, "hit": h, "expected_line": expected_line}
-        # PT hit exists but not our line → different ACE on same ACL
-        return {"matched": False, "hit": hits[0], "expected_line": expected_line}
+    hit = None
+    if m:
+        hit = {
+            "acl": m.group(1),
+            "action": m.group(2).lower(),
+            "rule_id": m.group(3)
+        }
 
-    # 3) We saw a hit but couldn’t confirm it’s ours (no rule-id and no line map)
-    return {"matched": None, "hit": hits[0], "expected_line": None}
+    matched = None
+    if hit:
+        matched = (str(rule.get("rule_id")) == hit["rule_id"])
+    return {"matched": matched, "hit": hit}
 
 # =========================
 # Packet-tracer runner (clean output)
@@ -842,3 +860,4 @@ def _write_global_summaries():
 # =========================
 if __name__ == "__main__":
     parse_acl_and_test()
+
