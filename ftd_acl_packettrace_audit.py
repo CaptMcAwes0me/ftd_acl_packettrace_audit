@@ -37,7 +37,7 @@ import html
 import ipaddress
 import subprocess
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 
 # =========================
 # Settings / Defaults
@@ -560,6 +560,75 @@ def extract_pt_result(output: str) -> str:
 # =========================
 # ACL match helpers (which ACE actually matched?)
 # =========================
+
+# Cache for rule-id → friendly name (from remarks)
+RULE_NAME_CACHE = {}
+
+# keep your existing RULE_NAME_CACHE = {} above this
+def get_rule_name(rule_id: Union[str, int]) -> Optional[str]:
+    """
+    Look up a friendly name for a rule-id by parsing 'remark rule-id <id>:' lines.
+    Preference: 'L7 RULE: <name>' first; else 'ACCESS POLICY: <name>'; else first remark.
+    Returns the bare name (without the 'L7 RULE:' prefix), or None if not found.
+    """
+    try:
+        rid = str(rule_id).strip()
+        if rid in RULE_NAME_CACHE:
+            return RULE_NAME_CACHE[rid]
+        cmd = f"show running-config access-list | include rule-id {rid}:"
+        out = get_and_parse_cli_output(cmd)
+        lines = [ln.strip() for ln in out.splitlines() if f"rule-id {rid}:" in ln]
+        if not lines:
+            RULE_NAME_CACHE[rid] = None
+            return None
+
+        remarks = []
+        for ln in lines:
+            try:
+                remark_text = ln.split("rule-id", 1)[1]
+                remark_text = remark_text.split(":", 1)[1].strip()
+                remarks.append(remark_text)
+            except Exception:
+                continue
+
+        friendly = None
+        for r in remarks:
+            if r.upper().startswith("L7 RULE:"):
+                friendly = r.split(":", 1)[1].strip()
+                break
+        if not friendly:
+            for r in remarks:
+                if r.upper().startswith("ACCESS POLICY:"):
+                    friendly = r.split(":", 1)[1].strip()
+                    break
+        if not friendly and remarks:
+            friendly = remarks[0].strip()
+
+        if friendly:
+            friendly = friendly.lstrip("* ").strip()
+
+        RULE_NAME_CACHE[rid] = friendly or None
+        return RULE_NAME_CACHE[rid]
+    except Exception:
+        return None
+
+def format_hit_with_name(hit: dict) -> str:
+    """
+    Given the hit dict from determine_ace_match(), return "by <ACL> rule-id <id> '<name>'"
+    if a friendly name is found; otherwise without the name.
+    """
+    acl = hit.get("acl")
+    rid = hit.get("rule_id")
+    if acl and rid:
+        nm = get_rule_name(rid)
+        if nm:
+            return f"by {acl} rule-id {rid} '{nm}'"
+        return f"by {acl} rule-id {rid}"
+    # Fallback to line number if no rule-id present
+    if acl and (hit.get("line") is not None):
+        return f"by {acl} line {hit['line']}"
+    return "by <unknown>"
+
 ACL_SHOW_CACHE = {}   # acl_name -> raw "show access-list <acl>" output
 ACL_LINE_CACHE = {}   # (acl_name, rule_id_str) -> line_number_int
 
@@ -652,29 +721,55 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
 
     Behavior:
       • Final outcome is taken from the last 'Action:' line (ALLOW/DROP). If absent, we fall back to phase Results.
-      • For non-ALLOW outcomes (e.g., adjacency/NAT/prefilter issues), we still show whether the ACL phase
-        matched THIS ACE or a DIFFERENT ACE and which action that ACL phase took (PERMIT/DENY).
+      • Even when the final action is a drop (adjacency/NAT/prefilter/etc.), we still surface ACL-phase context:
+        whether THIS ACE matched, or a DIFFERENT ACE (and which one), plus the ACL-phase action (PERMIT/DENY).
       • When dropped, append the short drop reason code in brackets, e.g. [no-v4-adjacency].
+      • For flagged printing, use ⛔🟡 if final is DENY and a DIFFERENT ACE matched in ACL phase.
     """
     executed = []  # rows for this rule only
     proto = (rule.get("proto") or "").lower()
+    max_flag_print = int(os.environ.get("ACL_PT_MAX_FLAG_PRINT", "100"))
+
+    # -------- helpers local to this function --------
+    import re
 
     def _final_action(out: str):
-        """Return 'allow' or 'drop' if an Action line is present; otherwise None."""
-        import re
-        acts = re.findall(r'Action:\s*(\w+)', out, re.IGNORECASE)
+        """Return 'allow' or 'drop' from the last Action line if present; otherwise None."""
+        acts = re.findall(r'^\s*Action:\s*(\w+)', out, re.IGNORECASE | re.MULTILINE)
         return acts[-1].lower() if acts else None
 
     def _drop_reason(out: str):
-        """Parse the last Drop-reason short code, e.g., 'sp-security-failed'."""
-        import re
+        """Return the last short drop reason code, e.g., 'no-v4-adjacency', or None."""
         reasons = re.findall(r'^\s*Drop-reason:\s*\(([^)]+)\)', out, re.IGNORECASE | re.MULTILINE)
         return reasons[-1].strip() if reasons else None
 
+    def _format_hit_with_name(hit: dict) -> str:
+        """
+        Format '(by <ACL> rule-id <id> '<name>')' when a friendly name is available.
+        Uses global get_rule_name() if present; otherwise falls back to id only.
+        """
+        acl = hit.get("acl")
+        rid = hit.get("rule_id")
+        # try to call a global helper if it exists
+        nm = None
+        try:
+            nm = get_rule_name(rid)  # type: ignore[name-defined]
+        except Exception:
+            nm = None
+
+        if acl and rid:
+            if nm:
+                return f"by {acl} rule-id {rid} '{nm}'"
+            return f"by {acl} rule-id {rid}"
+        if acl and (hit.get("line") is not None):
+            return f"by {acl} line {hit['line']}"
+        return "by <unknown>"
+
     def _append_acl_phase_annotation(label: str, match_info: dict, final_is_allow: bool) -> str:
         """
-        Append ACL-phase context. For ALLOW (final), we keep the previous behavior.
-        For non-ALLOW final outcomes, we still indicate whether ACL phase permitted/denied and which ACE.
+        Append ACL-phase context. For ALLOW (final), keep the previous behavior.
+        For non-ALLOW final outcomes (e.g., adjacency/NAT issues), still indicate whether the
+        ACL phase PERMIT/DENY matched this or a different ACE.
         """
         hit = match_info.get("hit")
         matched = match_info.get("matched")
@@ -683,22 +778,16 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
             if matched is True:
                 return label + " (matched this ACE)"
             if matched is False and hit:
-                if hit.get("rule_id"):
-                    return label + f" (by {hit['acl']} rule-id {hit['rule_id']})"
-                if hit.get("line") is not None:
-                    return label + f" (by {hit['acl']} line {hit['line']})"
+                return label + f" ({_format_hit_with_name(hit)})"
             return label
 
         # Non-ALLOW final outcome → include ACL-phase details if available
         if hit:
-            acl_phase = hit.get("action", "").upper()  # 'permit'/'deny' from ACCESS-LIST phase
+            acl_phase = (hit.get("action") or "").upper()  # 'permit'/'deny' from ACCESS-LIST phase
+            suffix = f" ({_format_hit_with_name(hit)})"
             if matched is True:
                 return label + f" ; ACL phase: {acl_phase or 'UNKNOWN'} (matched this ACE)"
-            else:
-                if hit.get("rule_id"):
-                    return label + f" ; ACL phase: {acl_phase or 'UNKNOWN'} (by {hit['acl']} rule-id {hit['rule_id']})"
-                if hit.get("line") is not None:
-                    return label + f" ; ACL phase: {acl_phase or 'UNKNOWN'} (by {hit['acl']} line {hit['line']})"
+            return label + f" ; ACL phase: {acl_phase or 'UNKNOWN'}{suffix}"
         return label
 
     def get_ingress_for_src(src_ip):
@@ -708,14 +797,12 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
         if src_ip in ROUTE_IF_CACHE:
             return ROUTE_IF_CACHE[src_ip]
         ifname = find_ingress_interface(src_ip)
-        # Sometimes the route text literally shows "(interface)" — treat as unknown
-        if ifname and ifname.lower() == "interface":
+        if ifname and ifname.lower() == "interface":  # ignore literal placeholder
             ifname = None
         ROUTE_IF_CACHE[src_ip] = ifname
         return ifname
 
-    max_flag_print = int(os.environ.get("ACL_PT_MAX_FLAG_PRINT", "100"))
-
+    # -------- main execution loops --------
     for src_ip in (src_ips or []):
         src_ingress = get_ingress_for_src(src_ip)
         if not src_ingress:
@@ -729,19 +816,19 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
                 cmd = f"packet-tracer input {src_ingress} icmp {src_ip} 8 0 {dst_ip}"
                 out = get_and_parse_cli_output(cmd)
 
-                # Final action first; fallback parser if needed
+                # Final action first; fallback to extract_pt_result() if Action line is missing
                 fa = _final_action(out)
                 result = "ALLOW" if (fa and fa.startswith("allow")) else ("DENY" if fa else extract_pt_result(out))
 
                 match_info = determine_ace_match(rule, out)
 
-                # Build label
+                # Build label with drop reason and ACL phase context
                 label = result
                 if result.upper() == "DENY":
                     dr = _drop_reason(out)
                     if dr:
                         label += f" [{dr}]"
-                label = _append_acl_phase_annotation(label, match_info, final_is_allow=(result.upper()=="ALLOW"))
+                label = _append_acl_phase_annotation(label, match_info, final_is_allow=(result.upper() == "ALLOW"))
 
                 row = {
                     "acl": rule["acl_name"], "rule_id": rule["rule_id"], "proto": "icmp",
@@ -784,7 +871,7 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
                         dr = _drop_reason(out)
                         if dr:
                             label += f" [{dr}]"
-                    label = _append_acl_phase_annotation(label, match_info, final_is_allow=(result.upper()=="ALLOW"))
+                    label = _append_acl_phase_annotation(label, match_info, final_is_allow=(result.upper() == "ALLOW"))
 
                     row = {
                         "acl": rule["acl_name"], "rule_id": rule["rule_id"], "proto": proto,
@@ -806,10 +893,10 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
         print("-" * 60)
         return
 
-    allow = sum(1 for r in executed if r["result"].upper() == "ALLOW")
-    deny  = sum(1 for r in executed if r["result"].upper() == "DENY")
-    unkn  = sum(1 for r in executed if r["result"].upper() == "UNKNOWN")
-    matched_allow = sum(1 for r in executed if r["result"].upper() == "ALLOW" and r["matched"] is True)
+    allow = sum(1 for r in executed if (r["result"] or "").upper() == "ALLOW")
+    deny  = sum(1 for r in executed if (r["result"] or "").upper() == "DENY")
+    unkn  = sum(1 for r in executed if (r["result"] or "").upper() == "UNKNOWN")
+    matched_allow = sum(1 for r in executed if (r["result"] or "").upper() == "ALLOW" and r.get("matched") is True)
     other_allow   = allow - matched_allow
     ingress_set = sorted(set(r["ingress"] for r in executed if r.get("ingress")))
 
@@ -824,13 +911,17 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
         print(DIM(f"   acl={rule['acl_name']} srcs={len(src_ips or [])} dsts={len(dst_ips or [])}"))
 
     # ---- Print flagged commands (non-✅ or allowed by different ACE) ----
-    flagged = [r for r in executed if (r["result"].upper() != "ALLOW") or (r["matched"] is not True)]
+    flagged = [r for r in executed if ((r["result"] or "").upper() != "ALLOW") or (r.get("matched") is not True)]
     if flagged:
         print(DIM("   Flagged packet-tracers:"))
         for r in flagged[:max_flag_print]:
-            if r["result"].upper() == "DENY":
+            res = (r["result"] or "").upper()
+            matched = r.get("matched")
+            if res == "DENY" and matched is False:
+                icon = "⛔🟡"   # final DENY but ACL phase matched a DIFFERENT ACE
+            elif res == "DENY":
                 icon = "⛔"
-            elif r["result"].upper() == "ALLOW" and r["matched"] is not True:
+            elif res == "ALLOW" and matched is not True:
                 icon = "🟡"
             else:
                 icon = "❓"
