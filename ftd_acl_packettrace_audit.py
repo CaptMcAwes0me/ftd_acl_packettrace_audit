@@ -183,7 +183,19 @@ def parse_acl_and_test():
     LOG_DIR_GLOBAL = log_dir  # may be None when logging disabled
 
     for line in acl_lines:
-        print(f"\nProcessing rule:\n{line}")
+        print("\nProcessing rule:")
+        try:
+            # If we can parse the rule first, show the friendly remark line above the ACL line
+            tmp_rule = extract_rule_components_tokenized(line)
+            if tmp_rule and tmp_rule.get("rule_id"):
+                remark_line = get_rule_remark_line(tmp_rule["rule_id"])
+                if remark_line:
+                    print(remark_line)
+        except Exception:
+            # Non-fatal: if parsing fails here, we’ll still print the ACL line below
+            pass
+
+        print(line)
         rule = extract_rule_components_tokenized(line)
         if not rule:
             print("  [WARN] Could not parse this rule; skipping.")
@@ -560,6 +572,48 @@ def extract_pt_result(output: str) -> str:
 # =========================
 # ACL match helpers (which ACE actually matched?)
 # =========================
+
+# Cache for full remark line (exact ACL remark text)
+RULE_REMARK_LINE_CACHE = {}
+
+def get_rule_remark_line(rule_id):
+    """
+    Return the FULL ACL remark line for a rule-id, e.g.:
+      access-list CSM_FW_ACL_ remark rule-id 268444692: L7 RULE: F5 to TST MDX Health Check
+    Preference order: 'L7 RULE:' > 'ACCESS POLICY:' > first remark for that rule-id.
+    Returns None if nothing is found.
+    """
+    try:
+        rid = str(rule_id).strip()
+        if rid in RULE_REMARK_LINE_CACHE:
+            return RULE_REMARK_LINE_CACHE[rid]
+
+        # Pull only lines that include the rule-id with a colon (remark format uses ':')
+        cmd = f"show running-config access-list | include rule-id {rid}:"
+        out = get_and_parse_cli_output(cmd)
+        lines = [ln.rstrip() for ln in out.splitlines() if " remark " in ln and f"rule-id {rid}:" in ln]
+        if not lines:
+            RULE_REMARK_LINE_CACHE[rid] = None
+            return None
+
+        # Prefer L7 RULE, then ACCESS POLICY, otherwise first remark line
+        preferred = None
+        for ln in lines:
+            if "L7 RULE:" in ln.upper():
+                preferred = ln
+                break
+        if not preferred:
+            for ln in lines:
+                if "ACCESS POLICY:" in ln.upper():
+                    preferred = ln
+                    break
+        if not preferred:
+            preferred = lines[0]
+
+        RULE_REMARK_LINE_CACHE[rid] = preferred
+        return preferred
+    except Exception:
+        return None
 
 # Cache for rule-id → friendly name (from remarks)
 RULE_NAME_CACHE = {}
