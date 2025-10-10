@@ -27,6 +27,40 @@ It then reports:
 
 ## ✨ Features
 
+### ⚙️ Multi-Threaded Testing
+- Parallel packet-tracer execution with the ACL_PT_WORKERS variable (default: 8).
+- Thread-safe logging and shared route cache for performance.
+
+### 🧭 Dynamic Ingress Detection
+- Uses show route <src_ip> to identify ingress interfaces.
+- Falls back to default route only when % Network not in table.
+- Optional static fallback via ACL_PT_DEFAULT_IF.
+
+### 🧩 Full Object Expansion
+- Recursively expands network and service object-groups, including nested groups.
+- Handles object, object-group, range, and fqdn types (skips unresolved FQDNs).
+- Maps named services (http, https, ssh, etc.) to ports automatically.
+
+### 🧠 Rule Context Awareness
+- Parses rule-id and related remark lines (e.g., L7 RULE: or ACCESS POLICY:).
+- Identifies whether the matching ACE was the current rule or another.
+- Displays friendly rule names in summaries when available.
+
+### 🔍 Rich Result Context
+- Extracts Action, Drop-reason, and matched ACE from packet-tracer output.
+- Annotates each test with ACL phase information:
+- matched this ACE • by <ACL> rule-id <id> '<name>' • [drop-reason].
+
+### 🧾 Structured Artifacts
+- Per-rule logs: rule_<id>.log
+- Summary CSV and JSONL with every probe result.
+- Timestamped run directory for each execution.
+
+### 🧰 Flexible Output Modes
+- summary (default) – concise per-rule summary.
+- verbose – prints every packet-tracer command and outcome.
+- debug – adds previews of object, route, and parsing stages.
+
 ### 🚦 Per-Rule Summary with Icons
 - ✅ **ALLOW (matched this ACE)**
 - 🟡 **A different ACE matched first**
