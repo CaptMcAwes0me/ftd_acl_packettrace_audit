@@ -39,6 +39,20 @@ import subprocess
 import socket
 from datetime import datetime
 from typing import Optional, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+# --- Route cache (module-scope) ---
+ROUTE_IF_CACHE = {}  # maps source IP -> ingress ifname or None
+
+try:
+    ROUTE_IF_LOCK
+except NameError:
+    ROUTE_IF_LOCK = threading.Lock()
+
+ACL_PT_WORKERS = int(os.environ.get("ACL_PT_WORKERS", "8"))
+LOG_LOCK = threading.Lock()
+RESULTS_LOCK = threading.Lock()
 
 # =========================
 # Settings / Defaults
@@ -93,7 +107,6 @@ DIM      = lambda s: _c(s, "2")
 
 RESULTS = []        # list of dicts for CSV/JSONL
 LOG_DIR_GLOBAL = None
-ROUTE_IF_CACHE = {} # cache per-source-IP ingress lookups
 
 def _dbg(msg):
     if _is_debug():
@@ -1047,22 +1060,27 @@ def determine_ace_match(rule, pt_output):
 def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, log_dir):
     """
     Execute packet-tracer probes for the given rule and print a compact summary.
+
     - ICMP syntax: packet-tracer input <if> icmp <src> 8 0 <dst>
     - TCP/UDP:     packet-tracer input <if> <proto> <src> 12345 <dst> <dport>
 
     Behavior:
       • Final outcome is taken from the last 'Action:' line (ALLOW/DROP). If absent, we fall back to phase Results.
-      • Even when the final action is a drop (adjacency/NAT/prefilter/etc.), we still surface ACL-phase context:
-        whether THIS ACE matched, or a DIFFERENT ACE (and which one), plus the ACL-phase action (PERMIT/DENY).
+      • We always surface ACCESS-LIST phase context (matched THIS ACE vs DIFFERENT ACE + action PERMIT/DENY).
       • When dropped, append the short drop reason code in brackets, e.g. [no-v4-adjacency].
-      • For flagged printing, use ⛔🟡 if final is DENY and a DIFFERENT ACE matched in ACL phase.
+      • For flagged printing, show ⛔🟡 when final is DENY and ACL phase matched a DIFFERENT ACE.
+      • Probes run concurrently when ACL_PT_WORKERS > 1.
     """
     executed = []  # rows for this rule only
     proto = (rule.get("proto") or "").lower()
     max_flag_print = int(os.environ.get("ACL_PT_MAX_FLAG_PRINT", "100"))
+    workers = int(os.environ.get("ACL_PT_WORKERS", "1"))
 
-    # -------- helpers local to this function --------
     import re
+    import concurrent.futures
+    import threading
+
+    # ------- local helpers -------
 
     def _final_action(out: str):
         """Return 'allow' or 'drop' from the last Action line if present; otherwise None."""
@@ -1077,30 +1095,25 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
     def _format_hit_with_name(hit: dict) -> str:
         """
         Format '(by <ACL> rule-id <id> '<name>')' when a friendly name is available.
-        Uses global get_rule_name() if present; otherwise falls back to id only.
+        Falls back to id only; or line number when rule-id absent.
         """
         acl = hit.get("acl")
         rid = hit.get("rule_id")
-        # try to call a global helper if it exists
         nm = None
         try:
-            nm = get_rule_name(rid)  # type: ignore[name-defined]
+            nm = get_rule_name(rid)
         except Exception:
             nm = None
-
         if acl and rid:
-            if nm:
-                return f"by {acl} rule-id {rid} '{nm}'"
-            return f"by {acl} rule-id {rid}"
+            return f"by {acl} rule-id {rid} '{nm}'" if nm else f"by {acl} rule-id {rid}"
         if acl and (hit.get("line") is not None):
             return f"by {acl} line {hit['line']}"
         return "by <unknown>"
 
     def _append_acl_phase_annotation(label: str, match_info: dict, final_is_allow: bool) -> str:
         """
-        Append ACL-phase context. For ALLOW (final), keep the previous behavior.
-        For non-ALLOW final outcomes (e.g., adjacency/NAT issues), still indicate whether the
-        ACL phase PERMIT/DENY matched this or a different ACE.
+        Append ACL-phase context. For ALLOW final, annotate 'matched this ACE' or 'by <other ACE>'.
+        For non-ALLOW final outcomes, also show ACCESS-LIST phase action (PERMIT/DENY) and which ACE.
         """
         hit = match_info.get("hit")
         matched = match_info.get("matched")
@@ -1121,19 +1134,73 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
             return label + f" ; ACL phase: {acl_phase or 'UNKNOWN'}{suffix}"
         return label
 
+    # route cache access is shared; guard it when updating
+    _route_lock = threading.Lock()
+
     def get_ingress_for_src(src_ip):
-        # Prefer explicit interface on the ACE; otherwise per-source route lookup (with caching)
+        # Prefer explicit interface on the ACE
         if rule.get("src_if"):
             return rule["src_if"]
-        if src_ip in ROUTE_IF_CACHE:
-            return ROUTE_IF_CACHE[src_ip]
+
+        # Fast path: cached
+        with ROUTE_IF_LOCK:
+            if src_ip in ROUTE_IF_CACHE:
+                return ROUTE_IF_CACHE[src_ip]
+
+        # Miss: do the lookup
         ifname = find_ingress_interface(src_ip)
-        if ifname and ifname.lower() == "interface":  # ignore literal placeholder
+
+        # Some outputs literally contain the placeholder word "interface" – treat as unknown
+        if ifname and isinstance(ifname, str) and ifname.lower() == "interface":
             ifname = None
-        ROUTE_IF_CACHE[src_ip] = ifname
+
+        # Store back in cache
+        with ROUTE_IF_LOCK:
+            ROUTE_IF_CACHE[src_ip] = ifname
+
         return ifname
 
-    # -------- main execution loops --------
+    # A single probe (executes one packet-tracer) → returns row, cmd, label, full output
+    def _probe(src_ingress: str, src_ip: str, dst_ip: str, dport):
+        if proto.startswith("icmp"):
+            cmd = f"packet-tracer input {src_ingress} icmp {src_ip} 8 0 {dst_ip}"
+        else:
+            cmd = f"packet-tracer input {src_ingress} {proto} {src_ip} 12345 {dst_ip} {dport}"
+
+        out = get_and_parse_cli_output(cmd)
+
+        # Prefer final Action; fallback to extract_pt_result() if no Action line
+        fa = _final_action(out)
+        result = "ALLOW" if (fa and fa.startswith("allow")) else ("DENY" if fa else extract_pt_result(out))
+
+        match_info = determine_ace_match(rule, out)
+
+        # Build label with drop reason and ACL phase context
+        label = result
+        if result.upper() == "DENY":
+            dr = _drop_reason(out)
+            if dr:
+                label += f" [{dr}]"
+        label = _append_acl_phase_annotation(label, match_info, final_is_allow=(result.upper() == "ALLOW"))
+
+        row = {
+            "acl": rule["acl_name"],
+            "rule_id": rule["rule_id"],
+            "proto": ("icmp" if proto.startswith("icmp") else proto),
+            "src": src_ip,
+            "dst": dst_ip,
+            "dport": ("8/0" if proto.startswith("icmp") else dport),
+            "ingress": src_ingress,
+            "result": result,
+            "matched": match_info["matched"],
+            "label": label,
+            "cmd": cmd,
+        }
+        return row, cmd, label, out
+
+    # ------- build all tasks (serial list) -------
+
+    tasks = []
     for src_ip in (src_ips or []):
         src_ingress = get_ingress_for_src(src_ip)
         if not src_ingress:
@@ -1141,82 +1208,68 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
             _debug_show_route([src_ip])
             continue
 
-        for dst_ip in (dst_ips or []):
-            if proto.startswith("icmp"):
-                # ICMP echo-request (type 8, code 0) order: <src> <type> <code> <dst>
-                cmd = f"packet-tracer input {src_ingress} icmp {src_ip} 8 0 {dst_ip}"
-                out = get_and_parse_cli_output(cmd)
+        if proto.startswith("icmp"):
+            for dst_ip in (dst_ips or []):
+                tasks.append((src_ingress, src_ip, dst_ip, "8/0"))
+        else:
+            # determine destination ports to test
+            if ports:
+                dports = [ports[0]] if TEST_FIRST_PORT_ONLY else ports
+            else:
+                dports = [DEFAULT_TCP_PORT if proto == "tcp"
+                          else DEFAULT_UDP_PORT if proto == "udp"
+                          else 0]
+            for dst_ip in (dst_ips or []):
+                for dport in dports:
+                    tasks.append((src_ingress, src_ip, dst_ip, dport))
 
-                # Final action first; fallback to extract_pt_result() if Action line is missing
-                fa = _final_action(out)
-                result = "ALLOW" if (fa and fa.startswith("allow")) else ("DENY" if fa else extract_pt_result(out))
+    if not tasks:
+        print(f"\n[Summary for rule {rule['rule_id']}] (no tests)")
+        print("-" * 60)
+        return
 
-                match_info = determine_ace_match(rule, out)
+    # ------- execute (serial or concurrent) -------
 
-                # Build label with drop reason and ACL phase context
-                label = result
-                if result.upper() == "DENY":
-                    dr = _drop_reason(out)
-                    if dr:
-                        label += f" [{dr}]"
-                label = _append_acl_phase_annotation(label, match_info, final_is_allow=(result.upper() == "ALLOW"))
+    if workers <= 1:
+        # Serial execution keeps ordering stable
+        for (src_ingress, src_ip, dst_ip, dport) in tasks:
+            row, cmd, label, out = _probe(src_ingress, src_ip, dst_ip, dport)
+            executed.append(row)
+            RESULTS.append({**row})
+            _write_rule_log(rule['rule_id'], cmd, label, out, log_dir)
+            if _is_verbose():
+                print(f"   {cmd}  →  {label}")
+            elif row["result"] == "UNKNOWN" and _is_debug():
+                preview = "\n".join(out.splitlines()[:10])
+                print("  [DBG] packet-tracer preview (first 10 lines):")
+                print(preview)
+    else:
+        PRINT_LOCK = threading.Lock()
+        LOG_LOCK_LOCAL = threading.Lock()
 
-                row = {
-                    "acl": rule["acl_name"], "rule_id": rule["rule_id"], "proto": "icmp",
-                    "src": src_ip, "dst": dst_ip, "dport": "8/0",
-                    "ingress": src_ingress, "result": result,
-                    "matched": match_info["matched"], "label": label,
-                    "cmd": cmd,
-                }
+        def _submitter(pool):
+            futs = []
+            for t in tasks:
+                futs.append(pool.submit(_probe, *t))
+            return futs
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = _submitter(ex)
+            for fut in concurrent.futures.as_completed(futures):
+                row, cmd, label, out = fut.result()
                 executed.append(row)
                 RESULTS.append({**row})
-                _write_rule_log(rule['rule_id'], cmd, label, out, log_dir)
-
+                if LOG_ENABLED and log_dir:
+                    with LOG_LOCK_LOCAL:
+                        _write_rule_log(rule['rule_id'], cmd, label, out, log_dir)
                 if _is_verbose():
-                    print(f"   {cmd}  →  {label}")
-                elif result == "UNKNOWN" and _is_debug():
-                    preview = "\n".join(out.splitlines()[:10])
-                    print("  [DBG] ICMP packet-tracer preview (first 10 lines):")
-                    print(preview)
-
-            else:
-                # Determine destination ports to test
-                if ports:
-                    dports = [ports[0]] if TEST_FIRST_PORT_ONLY else ports
-                else:
-                    dports = [DEFAULT_TCP_PORT if proto == "tcp"
-                              else DEFAULT_UDP_PORT if proto == "udp"
-                              else 0]
-
-                for dport in dports:
-                    cmd = f"packet-tracer input {src_ingress} {proto} {src_ip} 12345 {dst_ip} {dport}"
-                    out = get_and_parse_cli_output(cmd)
-
-                    fa = _final_action(out)
-                    result = "ALLOW" if (fa and fa.startswith("allow")) else ("DENY" if fa else extract_pt_result(out))
-
-                    match_info = determine_ace_match(rule, out)
-
-                    label = result
-                    if result.upper() == "DENY":
-                        dr = _drop_reason(out)
-                        if dr:
-                            label += f" [{dr}]"
-                    label = _append_acl_phase_annotation(label, match_info, final_is_allow=(result.upper() == "ALLOW"))
-
-                    row = {
-                        "acl": rule["acl_name"], "rule_id": rule["rule_id"], "proto": proto,
-                        "src": src_ip, "dst": dst_ip, "dport": dport,
-                        "ingress": src_ingress, "result": result,
-                        "matched": match_info["matched"], "label": label,
-                        "cmd": cmd,
-                    }
-                    executed.append(row)
-                    RESULTS.append({**row})
-                    _write_rule_log(rule['rule_id'], cmd, label, out, log_dir)
-
-                    if _is_verbose():
+                    with PRINT_LOCK:
                         print(f"   {cmd}  →  {label}")
+                elif row["result"] == "UNKNOWN" and _is_debug():
+                    with PRINT_LOCK:
+                        preview = "\n".join(out.splitlines()[:10])
+                        print("  [DBG] packet-tracer preview (first 10 lines):")
+                        print(preview)
 
     # ---- Per-rule summary ----
     if not executed:
@@ -1245,6 +1298,15 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
     flagged = [r for r in executed if ((r["result"] or "").upper() != "ALLOW") or (r.get("matched") is not True)]
     if flagged:
         print(DIM("   Flagged packet-tracers:"))
+        # Sort for stable-ish output: DENY first, then ALLOW-but-different, then others; tie-break by cmd
+        def _sev(r):
+            res = (r["result"] or "").upper()
+            if res == "DENY":
+                return 0
+            if res == "ALLOW" and r.get("matched") is not True:
+                return 1
+            return 2
+        flagged.sort(key=lambda r: (_sev(r), r["cmd"]))
         for r in flagged[:max_flag_print]:
             res = (r["result"] or "").upper()
             matched = r.get("matched")
