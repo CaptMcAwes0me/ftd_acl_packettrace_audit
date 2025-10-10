@@ -36,6 +36,7 @@ import os
 import html
 import ipaddress
 import subprocess
+import socket
 from datetime import datetime
 from typing import Optional, Union
 
@@ -128,6 +129,125 @@ def get_and_parse_cli_output(cmd: str) -> str:
 # =========================
 # Helpers for show object/object-group (try with and without 'id')
 # =========================
+def _port_from_token(tok, proto_hint="tcp"):
+    """
+    Return an int port from a token that can be numeric ('21') or a service name ('ftp').
+    Falls back to None if it can't resolve.
+    """
+    tok = str(tok).strip().lower()
+    if tok.isdigit():
+        try:
+            val = int(tok)
+            return val if 0 <= val <= 65535 else None
+        except Exception:
+            return None
+    try:
+        return socket.getservbyname(tok, proto_hint)
+    except Exception:
+        # try without proto
+        try:
+            return socket.getservbyname(tok)
+        except Exception:
+            return None
+
+
+def _fetch_object_group_config(name):
+    """
+    Return the running-config block for an object-group by name.
+    Tries 'id' form first, then plain.
+    """
+    name = str(name).strip()
+    out = get_and_parse_cli_output(f"show running-config object-group id {name}")
+    if not out or "object-group" not in out:
+        out = get_and_parse_cli_output(f"show running-config object-group {name}")
+    return out or ""
+
+
+def _parse_service_object_group(name, proto_hint=None, first_only=True, _seen=None):
+    """
+    Parse a 'object-group service <NAME> <proto>' block and return a list of destination ports (ints).
+    Supports:
+      - 'port-object eq <name|number>'
+      - 'port-object range <start> <end>'  (uses 'start' as representative if first_only=True)
+      - nested 'group-object <NAME>'
+      - (best-effort) 'service-object' ASA variants
+    """
+    if _seen is None:
+        _seen = set()
+    key = f"svc::{name}"
+    if key in _seen:
+        return []
+    _seen.add(key)
+
+    cfg = _fetch_object_group_config(name)
+    if not cfg:
+        return []
+
+    # Header: object-group service NAME <proto>
+    # Extract proto from header if present
+    header_proto = None
+    m = re.search(r'(?im)^\s*object-group\s+service\s+\S+\s+([A-Za-z\-]+)', cfg)
+    if m:
+        header_proto = m.group(1).strip().lower()
+        # normalize 'tcp-udp' → 'tcp' for service-name resolution (will still run under caller proto)
+        if header_proto not in ("tcp", "udp"):
+            header_proto = proto_hint or "tcp"
+
+    ph = (proto_hint or header_proto or "tcp")
+
+    ports = []
+
+    for line in cfg.splitlines():
+        ln = line.strip()
+        if not ln or ln.lower().startswith("object-group"):
+            continue
+
+        # Nested group
+        gm = re.match(r'(?i)^group-object\s+(\S+)$', ln)
+        if gm:
+            ports.extend(_parse_service_object_group(gm.group(1), proto_hint=ph, first_only=first_only, _seen=_seen))
+            continue
+
+        # port-object eq <name|number>
+        pm = re.match(r'(?i)^port-object\s+eq\s+(\S+)$', ln)
+        if pm:
+            p = _port_from_token(pm.group(1), proto_hint=ph)
+            if p is not None:
+                ports.append(p)
+                if first_only:
+                    return ports
+            continue
+
+        # port-object range <start> <end>  (choose start as representative if first_only)
+        rm = re.match(r'(?i)^port-object\s+range\s+(\S+)\s+(\S+)$', ln)
+        if rm:
+            start_tok, end_tok = rm.group(1), rm.group(2)
+            ps = _port_from_token(start_tok, proto_hint=ph)
+            pe = _port_from_token(end_tok, proto_hint=ph)
+            if ps is not None and pe is not None:
+                if first_only:
+                    ports.append(ps)
+                    return ports
+                else:
+                    ports.extend(range(ps, pe + 1))
+            continue
+
+        # ASA/FTD sometimes: service-object tcp destination eq 443
+        sm = re.match(r'(?i)^service-object\s+([a-z\-]+)\s+(?:destination\s+)?eq\s+(\S+)$', ln)
+        if sm:
+            proto_seen = sm.group(1).lower()
+            tok = sm.group(2)
+            p = _port_from_token(tok, proto_hint=(proto_seen if proto_seen in ("tcp", "udp") else ph))
+            if p is not None:
+                ports.append(p)
+                if first_only:
+                    return ports
+            continue
+
+    # dedupe / sort
+    ports = sorted({p for p in ports if isinstance(p, int)})
+    return ports
+
 def _has_relevant_obj_lines(txt: str) -> bool:
     for s in txt.splitlines():
         s = s.strip().lower()
@@ -407,19 +527,176 @@ def extract_ips_from_object_output(output: str):
             print(f"  [WARN] FQDN object encountered ('{s}'); skipping (no DNS).")
     return sorted(set(ips))
 
-def resolve_service(identifier: str):
-    """Resolve service specifier into destination ports list (empty => any)."""
-    if not identifier:
+def resolve_service(service_token, proto_hint=None):
+    """
+    Return a list of destination ports for the rule's service.
+
+    Handles:
+      - object-group service NAME <proto>    (including nested groups)
+      - tokens captured as ['object-group','NAME'] OR ['object-group NAME'] OR ['NAME']
+      - named services ('http','https', etc.) and numeric ports
+      - 'eq <name|num>' patterns
+      - falls back to [] (caller may apply defaults)
+    """
+    import re
+    import socket
+
+    def _port_from_token(tok, ph="tcp"):
+        tok = str(tok).strip().lower()
+        if tok.isdigit():
+            try:
+                v = int(tok);  # 0..65535
+                return v if 0 <= v <= 65535 else None
+            except Exception:
+                return None
+        try:
+            return socket.getservbyname(tok, ph)
+        except Exception:
+            try:
+                return socket.getservbyname(tok)
+            except Exception:
+                return None
+
+    def _fetch_og(name):
+        name = str(name).strip()
+        out = get_and_parse_cli_output(f"show running-config object-group id {name}")
+        if not out or "object-group" not in out:
+            out = get_and_parse_cli_output(f"show running-config object-group {name}")
+        return out or ""
+
+    def _parse_service_group(name, ph="tcp", first_only=True, _seen=None):
+        if _seen is None:
+            _seen = set()
+        key = f"svc::{name}"
+        if key in _seen:
+            return []
+        _seen.add(key)
+
+        cfg = _fetch_og(name)
+        if not cfg:
+            return []
+
+        # detect header like: object-group service NAME <proto>
+        m = re.search(r'(?im)^\s*object-group\s+service\s+\S+\s+([A-Za-z\-]+)', cfg)
+        header_proto = m.group(1).strip().lower() if m else None
+        if header_proto not in ("tcp","udp"):
+            header_proto = ph
+
+        ports = []
+        for line in cfg.splitlines():
+            ln = line.strip()
+            if not ln or ln.lower().startswith("object-group"):
+                continue
+
+            # nested group
+            g = re.match(r'(?i)^group-object\s+(\S+)$', ln)
+            if g:
+                ports.extend(_parse_service_group(g.group(1), ph=header_proto or ph, first_only=first_only, _seen=_seen))
+                if first_only and ports:
+                    return ports
+                continue
+
+            # port-object eq <name|num>
+            pm = re.match(r'(?i)^port-object\s+eq\s+(\S+)$', ln)
+            if pm:
+                p = _port_from_token(pm.group(1), ph or header_proto or "tcp")
+                if p is not None:
+                    ports.append(p)
+                    if first_only:
+                        return ports
+                continue
+
+            # port-object range <start> <end>
+            rm = re.match(r'(?i)^port-object\s+range\s+(\S+)\s+(\S+)$', ln)
+            if rm:
+                ps = _port_from_token(rm.group(1), ph or header_proto or "tcp")
+                pe = _port_from_token(rm.group(2), ph or header_proto or "tcp")
+                if ps is not None and pe is not None:
+                    if first_only:
+                        ports.append(ps)
+                        return ports
+                    ports.extend(range(ps, pe + 1))
+                continue
+
+            # ASA variant: service-object tcp destination eq 443
+            sm = re.match(r'(?i)^service-object\s+([a-z\-]+)(?:\s+destination)?\s+eq\s+(\S+)$', ln)
+            if sm:
+                pproto = sm.group(1).lower()
+                tok = sm.group(2)
+                p = _port_from_token(tok, pproto if pproto in ("tcp","udp") else (ph or "tcp"))
+                if p is not None:
+                    ports.append(p)
+                    if first_only:
+                        return ports
+                continue
+
+        return sorted({p for p in ports if isinstance(p, int)})
+
+    # -------- normalize inputs --------
+    if not service_token:
         return []
-    if identifier.startswith("object-group "):
-        name = identifier.split()[1]
-        out = show_object_group_block(name)
-        return extract_ports_from_service_group_output(out)
-    if identifier.startswith("object "):
-        name = identifier.split()[1]
-        out = show_object_block(name)
-        return extract_ports_from_service_group_output(out)
-    return []
+
+    # Gather raw tokens; support string or list/tuple
+    if isinstance(service_token, (list, tuple)):
+        raw = [str(t) for t in service_token if str(t).strip()]
+    else:
+        raw = [str(service_token)]
+
+    # Split any combined tokens like "object-group HTTPS" into separate tokens
+    toks = []
+    for t in raw:
+        parts = [p for p in t.strip().split() if p]
+        toks.extend(parts if parts else [t.strip()])
+
+    # Protocol hint
+    ph = (proto_hint or (rule.get("proto") if 'rule' in globals() else None) or "tcp").lower()
+
+    out_ports = []
+    i = 0
+    while i < len(toks):
+        t = toks[i].lower()
+
+        # Pattern: object-group <NAME>
+        if t == "object-group" and (i + 1) < len(toks):
+            name = toks[i + 1]
+            out_ports.extend(_parse_service_group(name, ph=ph, first_only=TEST_FIRST_PORT_ONLY))
+            if out_ports and TEST_FIRST_PORT_ONLY:
+                return out_ports
+            i += 2
+            continue
+
+        # Pattern: bare group name that might be a service group (e.g., 'HTTPS')
+        # Try to fetch and see if it looks like a service group header
+        cfg_try = _fetch_og(toks[i])
+        if cfg_try and re.search(r'(?im)^\s*object-group\s+service\s+\S+\s+', cfg_try):
+            # It's a service group; parse it
+            out_ports.extend(_parse_service_group(toks[i], ph=ph, first_only=TEST_FIRST_PORT_ONLY))
+            if out_ports and TEST_FIRST_PORT_ONLY:
+                return out_ports
+            i += 1
+            continue
+
+        # Pattern: eq <name|number>
+        if t == "eq" and (i + 1) < len(toks):
+            p = _port_from_token(toks[i + 1], ph)
+            if p is not None:
+                out_ports.append(p)
+                if TEST_FIRST_PORT_ONLY:
+                    return out_ports
+            i += 2
+            continue
+
+        # Single token that might be a named service (http/https) or numeric port
+        p = _port_from_token(t, ph)
+        if p is not None:
+            out_ports.append(p)
+            if TEST_FIRST_PORT_ONLY:
+                return out_ports
+
+        i += 1
+
+    return sorted({p for p in out_ports if isinstance(p, int)})
+
 
 def extract_ports_from_service_group_output(output: str):
     """Parse service object-group definitions to a list of ports."""
