@@ -34,9 +34,11 @@ Usage:
 Output:
   - results.csv: All packet-tracer test results with rule names and details
   - results_flagged.csv: Only tests that did NOT match the expected ACE (for issue review)
+  - by_matched_rule/: Directory with per-rule CSVs grouped by which rule was matched
   - results_shadowing.csv: ACL shadowing issues (when ACL_PT_SHADOW_DETECT=1)
   - results.jsonl: JSON Lines format (when ACL_PT_LOG=1)
   - rule_*.log: Individual packet-tracer outputs per rule (when ACL_PT_LOG=1)
+  - acl_packet_tracer_YYYYMMDD_HHMMSS.zip: Compressed archive of all output files
 
 DISCLAIMER
 
@@ -1663,6 +1665,96 @@ def _write_shadowing_csv():
     except Exception as e:
         print(f"[ERROR] Shadowing CSV write error: {e}")
 
+
+def _write_by_matched_rule_csvs():
+    """Write separate CSV files for each matched rule (non-matching tests grouped by what they matched)."""
+    if not LOG_DIR_GLOBAL or not RESULTS:
+        return
+    
+    # Filter to only non-matching results
+    flagged_results = [r for r in RESULTS if r.get("matched") is not True]
+    if not flagged_results:
+        return
+    
+    try:
+        import csv
+        import re
+        
+        # Create subdirectory for per-rule CSVs
+        by_rule_dir = os.path.join(LOG_DIR_GLOBAL, "by_matched_rule")
+        os.makedirs(by_rule_dir, exist_ok=True)
+        
+        # Group results by the rule they actually matched
+        matched_rule_groups = {}
+        for row in flagged_results:
+            # Extract matched rule ID from label if available
+            label = row.get("label", "")
+            matched_rule_id = None
+            matched_rule_name = None
+            
+            # Try to extract rule-id from label (e.g., "ALLOW (by rule-id 268436500)")
+            match = re.search(r'rule-id\s+(\d+)', label)
+            if match:
+                matched_rule_id = match.group(1)
+                matched_rule_name = get_rule_name(matched_rule_id) or f"Rule_{matched_rule_id}"
+            else:
+                # No specific rule matched, group as "unmatched"
+                matched_rule_id = "unknown"
+                matched_rule_name = "Unknown_or_Denied"
+            
+            key = f"{matched_rule_id}_{matched_rule_name}"
+            if key not in matched_rule_groups:
+                matched_rule_groups[key] = []
+            matched_rule_groups[key].append(row)
+        
+        fieldnames = [
+            "acl","rule_id","rule_name","proto","src","dst","dport","ingress","result","matched","label","cmd"
+        ]
+        
+        # Write a CSV for each matched rule
+        file_count = 0
+        for key, rows in matched_rule_groups.items():
+            # Sanitize filename
+            safe_filename = re.sub(r'[^\w\-_]', '_', key)
+            safe_filename = safe_filename[:100]  # Limit length
+            csv_path = os.path.join(by_rule_dir, f"matched_by_{safe_filename}.csv")
+            
+            with open(csv_path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                for row in rows:
+                    w.writerow(row)
+            file_count += 1
+        
+        print(f"✅ Per-matched-rule CSVs written to: {by_rule_dir}/")
+        print(f"   ({file_count} files created, grouped by which rule was matched)")
+    except Exception as e:
+        print(f"[ERROR] Per-matched-rule CSV write error: {e}")
+
+
+def _create_zip_archive():
+    """Create a zip archive of the entire output directory."""
+    if not LOG_DIR_GLOBAL:
+        return
+    
+    try:
+        import shutil
+        
+        # Create zip file in parent directory
+        zip_base = os.path.basename(LOG_DIR_GLOBAL)
+        zip_path = f"{LOG_DIR_GLOBAL}.zip"
+        
+        # Create the archive
+        shutil.make_archive(LOG_DIR_GLOBAL, 'zip', os.path.dirname(LOG_DIR_GLOBAL), zip_base)
+        
+        # Get zip file size for display
+        zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+        
+        print(f"\n✅ Archive created: {zip_path}")
+        print(f"   ({zip_size_mb:.2f} MB)")
+    except Exception as e:
+        print(f"[ERROR] Zip creation error: {e}")
+
 # =========================
 # Logging summaries
 # =========================
@@ -1712,6 +1804,9 @@ def _write_global_summaries():
             print(f"   ({len(flagged_results)} of {len(RESULTS)} tests did not match expected ACE)")
         else:
             print(f"✅ No flagged results - all tests matched expected ACE!")
+        
+        # 3. Per-matched-rule CSVs (organized by which rule was actually matched)
+        _write_by_matched_rule_csvs()
             
     except Exception as e:
         print(f"[ERROR] CSV write error: {e}")
@@ -1727,6 +1822,9 @@ def _write_global_summaries():
             print(f"✅ JSONL written to: {j_path}")
         except Exception as e:
             _dbg(f"[DBG] JSONL write error: {e}")
+    
+    # Create zip archive of everything
+    _create_zip_archive()
 
 
 def _print_final_summary(start_time):
