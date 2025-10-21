@@ -33,6 +33,8 @@ It then reports:
 ### 📊 CSV Output (Always Enabled)
 - **results.csv**: Complete test results with rule names and details
 - **results_flagged.csv**: Only tests that didn't match expected ACE (for quick issue review)
+- **results_untested.csv**: Rules parsed but generated 0 tests (with diagnostic reasons)
+- **results_fmc_rule_expansions.csv**: Shows how FMC rules expand into multiple ACL entries
 - **by_matched_rule/**: Per-rule CSVs grouped by which rule was actually matched (for focused troubleshooting)
 - **results_shadowing.csv**: ACL shadowing detection report (when enabled)
 - **ZIP archive**: All output files automatically compressed for easy sharing
@@ -51,8 +53,11 @@ It then reports:
 
 ### 🧩 Full Object Expansion
 - Recursively expands network and service object-groups, including nested groups.
-- Handles object, object-group, range, and fqdn types (skips unresolved FQDNs).
+- Handles object, object-group, range, and fqdn types (skips unresolved FQDNs with warnings).
 - Maps named services (http, https, ssh, etc.) to ports automatically.
+- Supports inline port specifications (eq, range, lt, gt, neq) in ACL lines.
+- Resolves service object-groups in protocol position (e.g., `permit object-group ICMP-ALL`).
+- Protocol-aware service resolution for accurate port mapping.
 
 ### 🧠 Rule Context Awareness
 - Parses rule-id and related remark lines (e.g., L7 RULE: or ACCESS POLICY:).
@@ -62,7 +67,9 @@ It then reports:
 ### 🔍 Rich Result Context
 - Extracts Action, Drop-reason, and matched ACE from packet-tracer output.
 - Annotates each test with ACL phase information:
-- matched this ACE • by <ACL> rule-id <id> '<name>' • [drop-reason].
+  - matched this ACE • by <ACL> rule-id <id> '<name>' • [drop-reason].
+- Detailed skip diagnostics showing why rules weren't tested.
+- FMC rule expansion tracking (explains why 565 ACL lines = 250 unique rules).
 
 ### 🧾 Structured Artifacts
 - **CSV files (always created)**: Complete results, flagged results, and shadowing report
@@ -151,6 +158,8 @@ python3 ftd_acl_packettrace_audit.py
 Output:
 - `/var/tmp/acl_packet_tracer_YYYYMMDD_HHMMSS/results.csv`
 - `/var/tmp/acl_packet_tracer_YYYYMMDD_HHMMSS/results_flagged.csv`
+- `/var/tmp/acl_packet_tracer_YYYYMMDD_HHMMSS/results_fmc_rule_expansions.csv`
+- `/var/tmp/acl_packet_tracer_YYYYMMDD_HHMMSS.zip` (all files compressed)
 
 ### 🗣️ Verbose / Debug Modes
 Show each `packet-tracer` command and result:
@@ -296,6 +305,8 @@ A timestamped directory is created for each run, for example:
 /var/tmp/acl_packet_tracer_YYYYMMDD_HHMMSS/
   ├─ results.csv                           # ALL test results (always created)
   ├─ results_flagged.csv                   # Non-matching tests only (always created)
+  ├─ results_untested.csv                  # Rules with 0 tests + reasons (if any)
+  ├─ results_fmc_rule_expansions.csv       # Multi-service FMC rule expansions (if any)
   ├─ by_matched_rule/                      # Per-matched-rule CSVs (always created)
   │   ├─ matched_by_268436500_Default_Rule.csv
   │   ├─ matched_by_268436450_Broader_Range.csv
@@ -319,6 +330,16 @@ acl, rule_id, rule_name, proto, src, dst, dport, ingress, result, matched, label
 ```text
 acl, shadowed_rule_id, shadowed_rule_name, shadowed_by_rule_id, shadowed_by_rule_name,
 test_ip, dst_ip, proto, dport, ingress, cmd
+```
+
+**results_untested.csv:**
+```text
+rule_id, rule_name, reason, src_ips_count, dst_ips_count, ingress_if, acl_line
+```
+
+**results_fmc_rule_expansions.csv:**
+```text
+rule_id, rule_name, acl_entry, acl_line
 ```
 
 ---
@@ -356,13 +377,16 @@ show running-config access-list | exclude remark
 ```
 
 ### 2️⃣ Parse Each Rule
-- Extract protocol, source, destination, service, rule-id, and optional interface.  
+- Extract protocol, source, destination, service, rule-id, and optional interface.
+- Handle service object-groups in protocol position (e.g., `permit object-group ICMP-ALL`).
+- Parse inline port specifications (eq, range, lt, gt, neq) in ACL lines.
 - Expand network objects and nested groups using:
   ```bash
   show running-config object-group id <name>
   show running-config object id <name>
   ```
-- Resolve service ports (names and ranges).
+- Resolve service ports with protocol context for accurate mapping.
+- Track FMC rule expansions (single FMC rule → multiple ACL entries).
 
 ### 3️⃣ Determine Ingress per Source IP
 ```bash
@@ -400,6 +424,10 @@ packet-tracer input <if> <proto> <src> 12345 <dst> <dport>
 - **Timeouts occurring:** Reduce `ACL_PT_WORKERS` to 8 or lower to decrease system load.
 - **Shadow detection too slow:** This is expected (O(n²) complexity). Use only for periodic comprehensive audits.
 - **CSV files not created:** Check permissions on `/var/tmp` or set `ACL_PT_LOG_DIR` to a writable location.
+- **Wrong ports being tested:** Ensure service object-groups are properly defined. Check `results_fmc_rule_expansions.csv` to see how rules expanded.
+- **FQDN objects skipped:** FQDNs require DNS resolution (not implemented). Rules with only FQDN objects will be skipped with warnings.
+- **Rules showing as "untested":** Check `results_untested.csv` for diagnostic reasons (no ingress interface, empty objects, etc.).
+- **Unique rule count lower than expected:** FMC expands multi-service rules into multiple ACL entries. See `results_fmc_rule_expansions.csv`.
 
 ---
 
