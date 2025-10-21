@@ -34,6 +34,8 @@ Usage:
 Output:
   - results.csv: All packet-tracer test results with rule names and details
   - results_flagged.csv: Only tests that did NOT match the expected ACE (for issue review)
+  - results_untested.csv: Rules that were parsed but generated 0 tests (with reasons)
+  - results_fmc_rule_expansions.csv: Shows how FMC rules expand into multiple ACL entries
   - by_matched_rule/: Directory with per-rule CSVs grouped by which rule was matched
   - results_shadowing.csv: ACL shadowing issues (when ACL_PT_SHADOW_DETECT=1)
   - results.jsonl: JSON Lines format (when ACL_PT_LOG=1)
@@ -417,6 +419,7 @@ def parse_acl_and_test():
     # Parse and collect all rules first
     print(f"Parsing and resolving {len(acl_lines)} ACL rules...")
     parsed_rules = []
+    skipped_rules = []
     parse_count = 0
     for line in acl_lines:
         parse_count += 1
@@ -424,17 +427,79 @@ def parse_acl_and_test():
             print(f"Parsing rules: {parse_count}/{len(acl_lines)}...", end="\r")
         
         rule = extract_rule_components_tokenized(line)
-        if rule:
-            # Resolve IPs and ports for each rule
-            rule['src_ips'] = resolve_objectish(rule.get("src"), role="src")
-            rule['dst_ips'] = resolve_objectish(rule.get("dst"), role="dst")
-            rule['ports'] = resolve_service(rule.get("service"))
-            rule['line'] = line
-            
-            if rule['src_ips'] and rule['dst_ips']:
-                parsed_rules.append(rule)
+        if not rule:
+            # Failed to parse - likely not "advanced" format or malformed
+            skipped_rules.append(("parse_failed", line))
+            continue
+        
+        # Resolve IPs and ports for each rule
+        rule['src_ips'] = resolve_objectish(rule.get("src"), role="src")
+        rule['dst_ips'] = resolve_objectish(rule.get("dst"), role="dst")
+        # Pass protocol to resolve_service for proper service group resolution
+        proto_for_service = resolve_protocol(rule.get("proto") or "tcp")
+        rule['ports'] = resolve_service(rule.get("service"), proto_hint=proto_for_service)
+        rule['line'] = line
+        
+        # Check if we have both source and destination IPs
+        if not rule['src_ips']:
+            skipped_rules.append(("no_src_ips", line, rule.get("src")))
+        elif not rule['dst_ips']:
+            skipped_rules.append(("no_dst_ips", line, rule.get("dst")))
+        else:
+            parsed_rules.append(rule)
     
-    print(f"\nParsed {len(parsed_rules)} valid rules (skipped {len(acl_lines) - len(parsed_rules)})\n")
+    print(f"\nParsed {len(parsed_rules)} valid rules (skipped {len(skipped_rules)})")
+    
+    # Check for duplicate rule IDs
+    rule_ids = [r['rule_id'] for r in parsed_rules]
+    unique_rule_ids = set(rule_ids)
+    duplicate_rule_info = []
+    
+    if len(rule_ids) != len(unique_rule_ids):
+        duplicate_count = len(rule_ids) - len(unique_rule_ids)
+        print(f"  [INFO] {len(unique_rule_ids)} unique FMC rules ({duplicate_count} ACL entries from multi-service rules)")
+        
+        # Track which rule IDs appear multiple times
+        from collections import Counter
+        rule_id_counts = Counter(rule_ids)
+        for rule_id, count in rule_id_counts.items():
+            if count > 1:
+                # Find all ACL lines with this rule_id
+                matching_rules = [r for r in parsed_rules if r['rule_id'] == rule_id]
+                for idx, r in enumerate(matching_rules, 1):
+                    duplicate_rule_info.append({
+                        'rule_id': rule_id,
+                        'rule_name': get_rule_name(rule_id) or '',
+                        'occurrence': f"{idx} of {count}",
+                        'acl_line': r['line']
+                    })
+    
+    # Track rules that don't generate tests
+    untested_rules = []
+    
+    # Report all skipped rules
+    if skipped_rules:
+        print(f"\n{DIM('--- Skipped Rules ---')}")
+        for skip_info in skipped_rules:
+            reason = skip_info[0]
+            line = skip_info[1]
+            
+            # Extract rule-id for better identification
+            rid_m = re.search(r"rule-id\s+(\d+)", line)
+            rule_id = rid_m.group(1) if rid_m else "unknown"
+            
+            if reason == "parse_failed":
+                print(f"  [WARN] Rule {rule_id}: Failed to parse (not 'advanced' format or malformed)")
+                print(f"         {line[:120]}")
+            elif reason == "no_src_ips":
+                src_spec = skip_info[2] if len(skip_info) > 2 else "unknown"
+                print(f"  [WARN] Rule {rule_id}: No source IPs resolved from '{src_spec}'")
+                print(f"         {line[:120]}")
+            elif reason == "no_dst_ips":
+                dst_spec = skip_info[2] if len(skip_info) > 2 else "unknown"
+                print(f"  [WARN] Rule {rule_id}: No destination IPs resolved from '{dst_spec}'")
+                print(f"         {line[:120]}")
+        print(f"{DIM('--- End Skipped Rules ---')}\n")
     
     total_rules = len(parsed_rules)
     processed = 0
@@ -471,11 +536,49 @@ def parse_acl_and_test():
             print(f"  {INFO_TXT('[INFO]')} dst={dst_ips}")
             print(f"  {INFO_TXT('[INFO]')} ports={ports if ports else ['(any)']}")
 
+        # Track how many tests this rule generates
+        tests_before = len(RESULTS)
         run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if, log_dir)
+        tests_generated = len(RESULTS) - tests_before
+        
+        # If no tests were generated, track it
+        if tests_generated == 0:
+            untested_rules.append({
+                'rule_id': rule['rule_id'],
+                'rule_name': rule_name,
+                'line': rule['line'],
+                'src_ips': src_ips,
+                'dst_ips': dst_ips,
+                'ports': ports,
+                'ingress_if': ingress_if
+            })
 
     print(f"\n\n{'='*70}")
     print(f"Processing complete! Processed {processed}/{total_rules} rules")
+    print(f"Untested rules collected: {len(untested_rules)}")
     print(f"{'='*70}\n")
+    
+    # Report untested rules
+    if untested_rules:
+        print(f"\n{DIM('--- Untested Rules (parsed but generated 0 tests) ---')}")
+        for urule in untested_rules:
+            print(f"  [INFO] Rule {urule['rule_id']}: {urule['rule_name']}")
+            print(f"         {urule['line'][:120]}")
+            
+            # Diagnose why no tests were generated
+            reasons = []
+            if not urule['src_ips']:
+                reasons.append("no source IPs")
+            if not urule['dst_ips']:
+                reasons.append("no destination IPs")
+            if not urule['ingress_if']:
+                reasons.append("no ingress interface")
+            
+            if reasons:
+                print(f"         Reason: {', '.join(reasons)}")
+            else:
+                print(f"         Reason: Unknown (has src={len(urule['src_ips'])} IPs, dst={len(urule['dst_ips'])} IPs, ingress={urule['ingress_if']})")
+        print(f"{DIM('--- End Untested Rules ---')}\n")
     
     # Shadow detection (if enabled)
     if SHADOW_DETECT_ENABLED:
@@ -484,7 +587,7 @@ def parse_acl_and_test():
         print(f"{'='*70}\n")
         detect_acl_shadowing(parsed_rules, log_dir)
     
-    _write_global_summaries()
+    _write_global_summaries(untested_rules, duplicate_rule_info)
     _print_final_summary(start_time)
 
 def extract_rule_components_tokenized(line: str):
@@ -509,8 +612,14 @@ def extract_rule_components_tokenized(line: str):
 
     acl_name = toks[1]
     action = toks[3]
-    proto  = toks[4]
-    i = 5
+    
+    # Protocol can be simple (tcp/udp/icmp/ip) or object-group reference
+    if toks[4] == "object-group" and len(toks) > 5:
+        proto = f"object-group {toks[5]}"
+        i = 6
+    else:
+        proto = toks[4]
+        i = 5
 
     # Optional src ifc
     src_if = None
@@ -520,6 +629,11 @@ def extract_rule_components_tokenized(line: str):
 
     # Source entity
     src, i = parse_entity(toks, i)
+    
+    # Optional source port specification (eq/range/lt/gt/neq)
+    src_port = ""
+    if i < len(toks) and toks[i] in ("eq", "range", "lt", "gt", "neq"):
+        src_port, i = parse_port_spec(toks, i)
 
     # Optional dst ifc
     dst_if = None
@@ -529,6 +643,11 @@ def extract_rule_components_tokenized(line: str):
 
     # Destination entity
     dst, i = parse_entity(toks, i)
+    
+    # Optional destination port specification (eq/range/lt/gt/neq)
+    dst_port = ""
+    if i < len(toks) and toks[i] in ("eq", "range", "lt", "gt", "neq"):
+        dst_port, i = parse_port_spec(toks, i)
 
     # Optional service (object-group/object)
     service = ""
@@ -539,6 +658,13 @@ def extract_rule_components_tokenized(line: str):
         elif toks[i] == "object" and i + 1 < len(toks):
             service = f"object {toks[i+1]}"
             i += 2
+    
+    # If no service object but we have inline port specs, use those
+    if not service and dst_port:
+        service = dst_port
+    elif not service and src_port:
+        # Source port only (unusual but possible)
+        service = src_port
 
     return {
         "acl_name": acl_name,
@@ -580,8 +706,86 @@ def parse_entity(toks, i):
         return (f"host {t}", i + 1)             # single host
     return (t, i + 1)
 
+def parse_port_spec(toks, i):
+    """
+    Parse port specification (eq/range/lt/gt/neq) at toks[i].
+    
+    Args:
+        toks: List of tokens from ACL line
+        i: Current index in token list (should be at eq/range/lt/gt/neq)
+    
+    Returns:
+        tuple: (port_spec_string, next_index)
+    """
+    if i >= len(toks):
+        return ("", i)
+    
+    operator = toks[i]
+    
+    if operator == "range" and i + 2 < len(toks):
+        # range <start> <end>
+        return (f"range {toks[i+1]} {toks[i+2]}", i + 3)
+    elif operator in ("eq", "lt", "gt", "neq") and i + 1 < len(toks):
+        # eq/lt/gt/neq <port>
+        return (f"{operator} {toks[i+1]}", i + 2)
+    
+    # Malformed port spec, skip operator only
+    return (operator, i + 1)
+
 def looks_like_ipv4(s: str) -> bool:
     return re.match(r"^\d{1,3}(\.\d{1,3}){3}$", s) is not None
+
+def resolve_protocol(proto_spec: str) -> str:
+    """
+    Resolve protocol specification to actual protocol name.
+    
+    Args:
+        proto_spec: Protocol specification (e.g., 'tcp', 'object-group ICMP-ALL')
+    
+    Returns:
+        str: Actual protocol name (tcp/udp/icmp/ip) or original if can't resolve
+    """
+    if not proto_spec:
+        return "ip"
+    
+    proto_spec = proto_spec.strip().lower()
+    
+    # Simple protocol
+    if proto_spec in ("tcp", "udp", "icmp", "icmp6", "ip", "esp", "ah", "gre"):
+        return proto_spec
+    
+    # Object-group reference
+    if proto_spec.startswith("object-group "):
+        parts = proto_spec.split()
+        if len(parts) >= 2:
+            og_name = parts[1]
+            # Fetch the service object-group
+            cfg = _fetch_object_group_config(og_name)
+            if cfg:
+                # Look for service-object lines to determine protocol
+                for line in cfg.splitlines():
+                    ln = line.strip().lower()
+                    
+                    # service-object icmp
+                    if ln.startswith("service-object icmp"):
+                        return "icmp"
+                    # service-object tcp
+                    if ln.startswith("service-object tcp"):
+                        return "tcp"
+                    # service-object udp
+                    if ln.startswith("service-object udp"):
+                        return "udp"
+                    # service-object ip
+                    if ln.startswith("service-object ip"):
+                        return "ip"
+                
+                # Check header: object-group service NAME <proto>
+                m = re.search(r'object-group\s+service\s+\S+\s+(tcp|udp|icmp|ip)', cfg, re.IGNORECASE)
+                if m:
+                    return m.group(1).lower()
+    
+    # Fallback: return original or 'ip'
+    return proto_spec if proto_spec not in ("object-group",) else "ip"
 
 def subnet_sample_ip(ip_str: str, mask_str: str) -> str:
     try:
@@ -619,12 +823,34 @@ def resolve_objectish(identifier: str, role: str = ""):
     if ident.startswith("object-group "):
         name = ident.split()[1]
         out = show_object_group_block(name)
-        return extract_ips_from_object_group_output(out)
+        ips = extract_ips_from_object_group_output(out)
+        if not ips and out:
+            # Object-group exists but returned no IPs - show what we got for debugging
+            # Skip if it's just FQDN (already warned) or if output looks like XML/error
+            if "fqdn" not in out.lower() and not out.startswith(("argc", "Error", "<")):
+                print(f"  [WARN] Object-group '{name}' returned no IPs. Config:")
+                relevant_lines = [l for l in out.splitlines() if l.strip() and not l.strip().startswith(("argc", "argv", "<", "show "))]
+                for line in relevant_lines[:5]:
+                    print(f"         {line}")
+                if len(relevant_lines) > 5:
+                    print(f"         ... ({len(relevant_lines)} total lines)")
+        return ips
 
     if ident.startswith("object "):
         name = ident.split()[1]
         out = show_object_block(name)
-        return extract_ips_from_object_output(out)
+        ips = extract_ips_from_object_output(out)
+        if not ips and out:
+            # Object exists but returned no IPs - show what we got for debugging
+            # Skip if it's just FQDN (already warned) or if output looks like XML/error
+            if "fqdn" not in out.lower() and not out.startswith(("argc", "Error", "<")):
+                print(f"  [WARN] Object '{name}' returned no IPs. Config:")
+                relevant_lines = [l for l in out.splitlines() if l.strip() and not l.strip().startswith(("argc", "argv", "<", "show "))]
+                for line in relevant_lines[:5]:
+                    print(f"         {line}")
+                if len(relevant_lines) > 5:
+                    print(f"         ... ({len(relevant_lines)} total lines)")
+        return ips
 
     if looks_like_ipv4(ident):
         return [ident]
@@ -815,6 +1041,34 @@ def resolve_service(service_token, proto_hint=None):
 
         # Pattern: eq <name|number>
         if t == "eq" and (i + 1) < len(toks):
+            p = _port_from_token(toks[i + 1], ph)
+            if p is not None:
+                out_ports.append(p)
+                if TEST_FIRST_PORT_ONLY:
+                    return out_ports
+            i += 2
+            continue
+        
+        # Pattern: range <start> <end>
+        if t == "range" and (i + 2) < len(toks):
+            ps = _port_from_token(toks[i + 1], ph)
+            pe = _port_from_token(toks[i + 2], ph)
+            if ps is not None and pe is not None:
+                if TEST_FIRST_PORT_ONLY:
+                    out_ports.append(ps)  # Use start of range as representative
+                    return out_ports
+                # Expand range (with safety limit)
+                actual_range = pe - ps + 1
+                if actual_range > 1000:
+                    print(f"  [WARN] Port range {ps}-{pe} ({actual_range} ports) is very large, using first port only")
+                    out_ports.append(ps)
+                else:
+                    out_ports.extend(range(ps, pe + 1))
+            i += 3
+            continue
+        
+        # Pattern: lt/gt/neq <port> (less common, use the port as representative)
+        if t in ("lt", "gt", "neq") and (i + 1) < len(toks):
             p = _port_from_token(toks[i + 1], ph)
             if p is not None:
                 out_ports.append(p)
@@ -1242,7 +1496,7 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
       • Probes run concurrently when ACL_PT_WORKERS > 1.
     """
     executed = []  # rows for this rule only
-    proto = (rule.get("proto") or "").lower()
+    proto = resolve_protocol(rule.get("proto") or "")
     max_flag_print = int(os.environ.get("ACL_PT_MAX_FLAG_PRINT", "100"))
     workers = ACL_PT_WORKERS  # Use global setting
 
@@ -1531,31 +1785,86 @@ def detect_acl_shadowing(parsed_rules, log_dir):
     """
     Detect ACL shadowing by testing each rule's IPs against all earlier rules.
     For each rule, test its source IPs with earlier rules to see if they would match first.
+    
+    Optimizations:
+    - Protocol filtering: Skip rules with non-overlapping protocols
+    - Result caching: Reuse packet-tracer results for identical test parameters
+    - Per-IP early exit: Stop testing an IP once we find which rule shadows it
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import threading
     
     shadow_lock = threading.Lock()
-    total_tests = 0
+    cache_lock = threading.Lock()
     completed_tests = 0
+    skipped_tests = 0
+    cached_hits = 0
     
-    # Count total tests
+    # Result cache: (src_ip, dst_ip, proto, dport, ingress_if) -> matched_rule_id
+    result_cache = {}
+    
+    # Track which IPs have already found their shadow (per current rule)
+    # Key: (current_rule_idx, test_ip) -> shadowing_rule_idx
+    shadowed_ips = {}
+    
+    # Count total tests (estimate before optimizations)
+    total_tests_estimate = 0
     for i, rule in enumerate(parsed_rules):
         if i > 0:  # Skip first rule (nothing to shadow it)
-            total_tests += len(rule['src_ips']) * i  # Test against all earlier rules
+            total_tests_estimate += len(rule['src_ips']) * i
     
-    print(f"Testing {len(parsed_rules)} rules for shadowing ({total_tests} tests)...")
+    print(f"Testing {len(parsed_rules)} rules for shadowing (up to {total_tests_estimate} tests with optimizations)...")
+    
+    def protocols_can_overlap(proto1, proto2):
+        """Check if two protocols can potentially overlap for shadowing."""
+        p1 = (proto1 or "").lower()
+        p2 = (proto2 or "").lower()
+        
+        # Exact match
+        if p1 == p2:
+            return True
+        
+        # 'ip' matches everything
+        if p1 == "ip" or p2 == "ip":
+            return True
+        
+        # ICMP variants
+        if p1.startswith("icmp") and p2.startswith("icmp"):
+            return True
+        
+        # Otherwise they don't overlap
+        return False
     
     def test_shadow(current_rule_idx, current_rule, earlier_rule_idx, earlier_rule, test_ip):
         """Test if test_ip from current_rule would match earlier_rule."""
-        nonlocal completed_tests
+        nonlocal completed_tests, skipped_tests, cached_hits
+        
+        # Optimization 1: Check if this IP already found its shadow
+        shadow_key = (current_rule_idx, test_ip)
+        with shadow_lock:
+            if shadow_key in shadowed_ips:
+                # This IP already found a shadow from an earlier rule, skip
+                skipped_tests += 1
+                return None
+        
+        # Optimization 2: Protocol filtering - skip if protocols don't overlap
+        if not protocols_can_overlap(current_rule.get("proto"), earlier_rule.get("proto")):
+            with shadow_lock:
+                skipped_tests += 1
+            return None
+        
+        # Optimization 3: Skip if different ACLs (rules in different ACLs can't shadow each other)
+        if current_rule.get("acl_name") != earlier_rule.get("acl_name"):
+            with shadow_lock:
+                skipped_tests += 1
+            return None
         
         # Get destination and port for testing
         dst_ip = current_rule['dst_ips'][0] if current_rule['dst_ips'] else None
         if not dst_ip:
             return None
         
-        proto = (current_rule.get("proto") or "").lower()
+        proto = resolve_protocol(current_rule.get("proto") or "")
         ports = current_rule['ports']
         
         # Determine port for test
@@ -1578,6 +1887,46 @@ def detect_acl_shadowing(parsed_rules, log_dir):
         if not ingress_if:
             return None
         
+        # Optimization 4: Check result cache
+        cache_key = (test_ip, dst_ip, proto, str(dport), ingress_if)
+        with cache_lock:
+            if cache_key in result_cache:
+                cached_rule_id = result_cache[cache_key]
+                cached_hits += 1
+                
+                # Check if the cached result matches the earlier rule we're testing
+                if cached_rule_id == earlier_rule['rule_id']:
+                    # Cache hit and it's a shadow match
+                    with shadow_lock:
+                        completed_tests += 1
+                        shadowed_ips[shadow_key] = earlier_rule_idx
+                        if not _is_verbose():
+                            print(f"Shadow detection: {completed_tests} tests, {skipped_tests} skipped, {cached_hits} cached...", end="\r")
+                    
+                    current_name = get_rule_name(current_rule['rule_id']) or ""
+                    earlier_name = get_rule_name(earlier_rule['rule_id']) or ""
+                    
+                    return {
+                        'shadowed_rule_id': current_rule['rule_id'],
+                        'shadowed_rule_name': current_name,
+                        'shadowed_by_rule_id': earlier_rule['rule_id'],
+                        'shadowed_by_rule_name': earlier_name,
+                        'test_ip': test_ip,
+                        'dst_ip': dst_ip,
+                        'proto': proto,
+                        'dport': dport,
+                        'ingress': ingress_if,
+                        'cmd': f"[CACHED]",
+                        'acl': current_rule['acl_name']
+                    }
+                else:
+                    # Cache hit but different rule matched, not a shadow
+                    with shadow_lock:
+                        completed_tests += 1
+                        if not _is_verbose():
+                            print(f"Shadow detection: {completed_tests} tests, {skipped_tests} skipped, {cached_hits} cached...", end="\r")
+                    return None
+        
         # Build packet-tracer command
         if proto.startswith("icmp"):
             cmd = f"packet-tracer input {ingress_if} icmp {test_ip} 8 0 {dst_ip}"
@@ -1590,13 +1939,29 @@ def detect_acl_shadowing(parsed_rules, log_dir):
         # Check which rule matched
         match_info = determine_ace_match(earlier_rule, out)
         
+        # Extract matched rule ID from output for caching
+        matched_rule_id = None
+        import re
+        rule_match = re.search(r'rule-id\s+(\d+)', out)
+        if rule_match:
+            matched_rule_id = rule_match.group(1)
+        
+        # Store in cache
+        if matched_rule_id:
+            with cache_lock:
+                result_cache[cache_key] = matched_rule_id
+        
         with shadow_lock:
             completed_tests += 1
             if not _is_verbose():
-                print(f"Shadow detection: {completed_tests}/{total_tests} tests...", end="\r")
+                print(f"Shadow detection: {completed_tests} tests, {skipped_tests} skipped, {cached_hits} cached...", end="\r")
         
         # If the earlier rule matched, we found shadowing
         if match_info.get("matched") is True:
+            # Mark this IP as shadowed (early exit for this IP)
+            with shadow_lock:
+                shadowed_ips[shadow_key] = earlier_rule_idx
+            
             current_name = get_rule_name(current_rule['rule_id']) or ""
             earlier_name = get_rule_name(earlier_rule['rule_id']) or ""
             
@@ -1637,6 +2002,9 @@ def detect_acl_shadowing(parsed_rules, log_dir):
                 SHADOWING_RESULTS.append(result)
     
     print(f"\n\nShadow detection complete: {len(SHADOWING_RESULTS)} shadowing issues found")
+    print(f"Performance: {completed_tests} tests executed, {skipped_tests} skipped, {cached_hits} cache hits")
+    efficiency = ((skipped_tests + cached_hits) / total_tests_estimate * 100) if total_tests_estimate > 0 else 0
+    print(f"Optimization saved {efficiency:.1f}% of potential tests")
     
     # Write shadowing CSV
     if SHADOWING_RESULTS:
@@ -1766,7 +2134,7 @@ def _write_rule_log(rule_id, cmd, result, out, log_dir):
         f.write(f"\nCOMMAND: {cmd}\nRESULT: {result}\n{out}\n{'-'*60}\n")
 
 
-def _write_global_summaries():
+def _write_global_summaries(untested_rules=None, duplicate_rule_info=None):
     # Always write CSV (detailed logs only when LOG_ENABLED)
     if not LOG_DIR_GLOBAL or not RESULTS:
         return
@@ -1807,6 +2175,53 @@ def _write_global_summaries():
         
         # 3. Per-matched-rule CSVs (organized by which rule was actually matched)
         _write_by_matched_rule_csvs()
+        
+        # 4. Untested rules CSV (parsed but generated 0 tests)
+        if untested_rules:
+            untested_path = os.path.join(LOG_DIR_GLOBAL, "results_untested.csv")
+            untested_fieldnames = ["rule_id", "rule_name", "reason", "src_ips_count", "dst_ips_count", "ingress_if", "acl_line"]
+            with open(untested_path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=untested_fieldnames)
+                w.writeheader()
+                for urule in untested_rules:
+                    # Determine reason
+                    reasons = []
+                    if not urule['src_ips']:
+                        reasons.append("no source IPs")
+                    if not urule['dst_ips']:
+                        reasons.append("no destination IPs")
+                    if not urule['ingress_if']:
+                        reasons.append("no ingress interface")
+                    reason = ', '.join(reasons) if reasons else "unknown"
+                    
+                    w.writerow({
+                        'rule_id': urule['rule_id'],
+                        'rule_name': urule['rule_name'],
+                        'reason': reason,
+                        'src_ips_count': len(urule['src_ips']),
+                        'dst_ips_count': len(urule['dst_ips']),
+                        'ingress_if': urule['ingress_if'] or '',
+                        'acl_line': urule['line']
+                    })
+            print(f"✅ Untested rules written to: {untested_path}")
+            print(f"   ({len(untested_rules)} rules parsed but generated 0 tests)")
+        
+        # 5. FMC Rule Expansions CSV (multiple ACL lines from single FMC rule)
+        if duplicate_rule_info:
+            expansion_path = os.path.join(LOG_DIR_GLOBAL, "results_fmc_rule_expansions.csv")
+            expansion_fieldnames = ["rule_id", "rule_name", "acl_entry", "acl_line"]
+            with open(expansion_path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=expansion_fieldnames)
+                w.writeheader()
+                for dup in duplicate_rule_info:
+                    w.writerow({
+                        'rule_id': dup['rule_id'],
+                        'rule_name': dup['rule_name'],
+                        'acl_entry': dup['occurrence'],
+                        'acl_line': dup['acl_line']
+                    })
+            print(f"✅ FMC rule expansions written to: {expansion_path}")
+            print(f"   ({len(duplicate_rule_info)} ACL entries from multi-service FMC rules)")
             
     except Exception as e:
         print(f"[ERROR] CSV write error: {e}")
@@ -1869,7 +2284,8 @@ def _print_final_summary(start_time):
     print(f"Execution time:            {time_str}")
     print(f"Throughput:                {tests_per_second:.1f} tests/second")
     print(f"Total packet-tracer tests: {total}")
-    print(f"Unique ACL rules tested:   {unique_rules}")
+    print(f"Unique rule IDs tested:    {unique_rules}")
+    print(f"  (Note: Multiple ACL lines may share the same rule-id)")
     print(f"")
     print(f"Results breakdown:")
     print(f"  {OK_TXT('✅ ALLOW')}:   {allow:5d} ({100*allow/total if total else 0:.1f}%)")
