@@ -5,12 +5,38 @@
 ftd_acl_packettrace_audit.py
 
 Audit Cisco FTD ACLs by expanding objects and verifying with packet-tracer.
-Maintainer: Garrett McCollum  |  Contact: gmccollu@cisco.com  |  Version: 0.1.0
+Results are automatically saved to a CSV file for easy analysis.
+
+Maintainer: Garrett McCollum  |  Contact: gmccollu@cisco.com  |  Version: 0.2.0
 
 Usage:
   python3 ftd_acl_packettrace_audit.py
+  
+  # Verbose output (show all packet-tracer commands)
   ACL_PT_PRINT_MODE=verbose python3 ftd_acl_packettrace_audit.py
+  
+  # Disable colors
   ACL_PT_COLOR=0 python3 ftd_acl_packettrace_audit.py
+  
+  # Enable detailed logging (per-rule packet-tracer outputs)
+  ACL_PT_LOG=1 python3 ftd_acl_packettrace_audit.py
+  
+  # Performance tuning (increase concurrent packet-tracer threads)
+  ACL_PT_WORKERS=32 python3 ftd_acl_packettrace_audit.py
+  # Default: 16 workers. Increase to 24-32 for faster execution on powerful systems.
+  # Decrease to 4-8 if you experience timeouts or system load issues.
+  
+  # Shadow detection (test for ACL rule shadowing - slower but comprehensive)
+  ACL_PT_SHADOW_DETECT=1 python3 ftd_acl_packettrace_audit.py
+  # Tests each rule's IPs against all earlier rules to detect shadowing.
+  # Significantly increases execution time but finds hidden policy issues.
+
+Output:
+  - results.csv: All packet-tracer test results with rule names and details
+  - results_flagged.csv: Only tests that did NOT match the expected ACE (for issue review)
+  - results_shadowing.csv: ACL shadowing issues (when ACL_PT_SHADOW_DETECT=1)
+  - results.jsonl: JSON Lines format (when ACL_PT_LOG=1)
+  - rule_*.log: Individual packet-tracer outputs per rule (when ACL_PT_LOG=1)
 
 DISCLAIMER
 
@@ -50,7 +76,7 @@ try:
 except NameError:
     ROUTE_IF_LOCK = threading.Lock()
 
-ACL_PT_WORKERS = int(os.environ.get("ACL_PT_WORKERS", "8"))
+ACL_PT_WORKERS = int(os.environ.get("ACL_PT_WORKERS", "16"))
 LOG_LOCK = threading.Lock()
 RESULTS_LOCK = threading.Lock()
 
@@ -61,9 +87,9 @@ RESULTS_LOCK = threading.Lock()
 # (you can set at runtime: export ACL_PT_DEFAULT_IF=YourInterfaceName)
 DEFAULT_INGRESS = os.environ.get("ACL_PT_DEFAULT_IF", "").strip() or None
 
-# Representative ports when service is "any"
-DEFAULT_TCP_PORT = 80
-DEFAULT_UDP_PORT = 53
+# Representative ports when service is "any" (configurable via environment)
+DEFAULT_TCP_PORT = int(os.environ.get("ACL_PT_DEFAULT_TCP_PORT", "80"))
+DEFAULT_UDP_PORT = int(os.environ.get("ACL_PT_DEFAULT_UDP_PORT", "53"))
 
 # Default ICMP echo request (type/code)
 ICMP_TYPE_DEFAULT = 8
@@ -88,6 +114,9 @@ LOG_ENABLED  = os.environ.get("ACL_PT_LOG", "0").strip().lower() in ("1", "true"
 # Base directory for logs when LOG_ENABLED=1
 LOG_DIR_BASE = (os.environ.get("ACL_PT_LOG_DIR", "/var/tmp").strip() or "/var/tmp")
 
+# -------- Shadow detection (opt-in) --------
+SHADOW_DETECT_ENABLED = os.environ.get("ACL_PT_SHADOW_DETECT", "0").strip().lower() in ("1", "true", "yes", "on")
+
 # -------- Output controls --------
 PRINT_MODE = os.environ.get("ACL_PT_PRINT_MODE", "summary").strip().lower()  # summary | verbose | debug
 USE_COLOR  = os.environ.get("ACL_PT_COLOR", "1").strip() != "0"
@@ -106,6 +135,7 @@ INFO_TXT = lambda s: _c(s, "36")           # cyan
 DIM      = lambda s: _c(s, "2")
 
 RESULTS = []        # list of dicts for CSV/JSONL
+SHADOWING_RESULTS = []  # list of shadowing issues
 LOG_DIR_GLOBAL = None
 
 def _dbg(msg):
@@ -121,6 +151,9 @@ def get_and_parse_cli_output(cmd: str) -> str:
         p = subprocess.Popen(["ConvergedCliClient", cmd],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout, stderr = p.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        return f"Error: Command '{cmd}' timed out after 90 seconds"
     except Exception as e:
         return f"Error executing command '{cmd}': {e}"
 
@@ -145,7 +178,13 @@ def get_and_parse_cli_output(cmd: str) -> str:
 def _port_from_token(tok, proto_hint="tcp"):
     """
     Return an int port from a token that can be numeric ('21') or a service name ('ftp').
-    Falls back to None if it can't resolve.
+    
+    Args:
+        tok: Port token (string or int) - can be numeric or service name
+        proto_hint: Protocol hint for service name resolution ("tcp" or "udp")
+    
+    Returns:
+        int: Port number (0-65535) or None if resolution fails
     """
     tok = str(tok).strip().lower()
     if tok.isdigit():
@@ -168,6 +207,12 @@ def _fetch_object_group_config(name):
     """
     Return the running-config block for an object-group by name.
     Tries 'id' form first, then plain.
+    
+    Args:
+        name: Object-group name or ID
+    
+    Returns:
+        str: Configuration block text or empty string if not found
     """
     name = str(name).strip()
     out = get_and_parse_cli_output(f"show running-config object-group id {name}")
@@ -179,11 +224,21 @@ def _fetch_object_group_config(name):
 def _parse_service_object_group(name, proto_hint=None, first_only=True, _seen=None):
     """
     Parse a 'object-group service <NAME> <proto>' block and return a list of destination ports (ints).
+    
     Supports:
       - 'port-object eq <name|number>'
       - 'port-object range <start> <end>'  (uses 'start' as representative if first_only=True)
       - nested 'group-object <NAME>'
       - (best-effort) 'service-object' ASA variants
+    
+    Args:
+        name: Service object-group name
+        proto_hint: Protocol hint ("tcp" or "udp") for port resolution
+        first_only: If True, return only the first port found (for performance)
+        _seen: Internal recursion tracking set to prevent cycles
+    
+    Returns:
+        list: Sorted list of integer port numbers
     """
     if _seen is None:
         _seen = set()
@@ -242,6 +297,9 @@ def _parse_service_object_group(name, proto_hint=None, first_only=True, _seen=No
                     ports.append(ps)
                     return ports
                 else:
+                    actual_range = pe - ps + 1
+                    if actual_range > 1000:
+                        print(f"  [WARN] Port range {ps}-{pe} ({actual_range} ports) in service group '{name}' is very large")
                     ports.extend(range(ps, pe + 1))
             continue
 
@@ -276,6 +334,16 @@ def _has_relevant_grp_lines(txt: str) -> bool:
     return False
 
 def show_object_block(name: str) -> str:
+    """
+    Fetch the running-config block for a network object.
+    Tries 'id' form first, then plain name.
+    
+    Args:
+        name: Object name or ID
+    
+    Returns:
+        str: Configuration block text
+    """
     out = get_and_parse_cli_output(f"show running-config object id {name}")
     if not _has_relevant_obj_lines(out):
         out2 = get_and_parse_cli_output(f"show running-config object {name}")
@@ -284,6 +352,16 @@ def show_object_block(name: str) -> str:
     return out
 
 def show_object_group_block(name: str) -> str:
+    """
+    Fetch the running-config block for an object-group.
+    Tries 'id' form first, then plain name.
+    
+    Args:
+        name: Object-group name or ID
+    
+    Returns:
+        str: Configuration block text
+    """
     out = get_and_parse_cli_output(f"show running-config object-group id {name}")
     if not _has_relevant_grp_lines(out):
         out2 = get_and_parse_cli_output(f"show running-config object-group {name}")
@@ -295,6 +373,17 @@ def show_object_group_block(name: str) -> str:
 # ACL Parsing + main loop
 # =========================
 def parse_acl_and_test():
+    """
+    Main orchestration function that:
+    1. Fetches all ACL rules from running-config
+    2. Parses each rule to extract components
+    3. Resolves objects/groups to IP addresses and ports
+    4. Runs packet-tracer tests for each rule
+    5. Generates summary reports (CSV/JSONL if logging enabled)
+    """
+    import time
+    start_time = time.time()
+    
     acl_output = get_and_parse_cli_output("show running-config access-list | exclude remark")
     acl_lines = [line.strip() for line in acl_output.splitlines() if line.startswith("access-list")]
     if not acl_lines:
@@ -303,41 +392,71 @@ def parse_acl_and_test():
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Only create a run directory if logging is enabled
+    # Always create output directory for CSV (detailed logs only if LOG_ENABLED)
+    log_dir = os.path.join(LOG_DIR_BASE, f"acl_packet_tracer_{ts}")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    csv_path = os.path.join(log_dir, "results.csv")
+    print(f"\n{'='*70}")
+    print(f"FTD ACL Packet-Tracer Audit")
+    print(f"{'='*70}")
+    print(f"Output directory: {log_dir}")
+    print(f"Results CSV: {csv_path}")
+    print(f"Worker threads: {ACL_PT_WORKERS} (set ACL_PT_WORKERS to adjust)")
     if LOG_ENABLED:
-        log_dir = os.path.join(LOG_DIR_BASE, f"acl_packet_tracer_{ts}")
-        os.makedirs(log_dir, exist_ok=True)
-        print(DIM(f"[logging enabled] run dir: {log_dir}"))
-    else:
-        log_dir = None
-        print(DIM("[logging disabled] no packet-tracer output or summaries will be written"))
+        print(f"Detailed logging: ENABLED")
+    if SHADOW_DETECT_ENABLED:
+        print(f"Shadow detection: ENABLED (will test for ACL shadowing)")
+    print(f"{'='*70}\n")
 
     global LOG_DIR_GLOBAL
-    LOG_DIR_GLOBAL = log_dir  # may be None when logging disabled
+    LOG_DIR_GLOBAL = log_dir
 
+    # Parse and collect all rules first
+    print(f"Parsing and resolving {len(acl_lines)} ACL rules...")
+    parsed_rules = []
+    parse_count = 0
     for line in acl_lines:
-        print("\nProcessing rule:")
-        try:
-            # If we can parse the rule first, show the friendly remark line above the ACL line
-            tmp_rule = extract_rule_components_tokenized(line)
-            if tmp_rule and tmp_rule.get("rule_id"):
-                remark_line = get_rule_remark_line(tmp_rule["rule_id"])
-                if remark_line:
-                    print(remark_line)
-        except Exception:
-            # Non-fatal: if parsing fails here, we’ll still print the ACL line below
-            pass
-
-        print(line)
+        parse_count += 1
+        if not _is_verbose():
+            print(f"Parsing rules: {parse_count}/{len(acl_lines)}...", end="\r")
+        
         rule = extract_rule_components_tokenized(line)
-        if not rule:
-            print("  [WARN] Could not parse this rule; skipping.")
-            continue
+        if rule:
+            # Resolve IPs and ports for each rule
+            rule['src_ips'] = resolve_objectish(rule.get("src"), role="src")
+            rule['dst_ips'] = resolve_objectish(rule.get("dst"), role="dst")
+            rule['ports'] = resolve_service(rule.get("service"))
+            rule['line'] = line
+            
+            if rule['src_ips'] and rule['dst_ips']:
+                parsed_rules.append(rule)
+    
+    print(f"\nParsed {len(parsed_rules)} valid rules (skipped {len(acl_lines) - len(parsed_rules)})\n")
+    
+    total_rules = len(parsed_rules)
+    processed = 0
+    
+    # Process each rule
+    for rule in parsed_rules:
+        processed += 1
+        
+        # Get friendly name for progress display
+        rule_name = get_rule_name(rule.get("rule_id")) or rule.get("rule_id")
+        
+        if _is_verbose():
+            print(f"\n[{processed}/{total_rules}] Processing rule {rule['rule_id']}: {rule_name}")
+            remark_line = get_rule_remark_line(rule["rule_id"])
+            if remark_line:
+                print(f"  {remark_line}")
+            print(f"  {rule['line']}")
+        else:
+            # Compact progress indicator
+            print(f"[{processed}/{total_rules}] Rule {rule['rule_id']}: {rule_name[:60]}...", end="\r")
 
-        # Resolve per-rule
-        dst_ips = resolve_objectish(rule.get("dst"), role="dst")
-        src_ips = resolve_objectish(rule.get("src"), role="src")
-        ports = resolve_service(rule.get("service"))
+        src_ips = rule['src_ips']
+        dst_ips = rule['dst_ips']
+        ports = rule['ports']
         ingress_if = rule.get("src_if")
 
         # Determine ingress if missing (initial hint only; per-source lookup done later)
@@ -349,30 +468,34 @@ def parse_acl_and_test():
             print(f"  {INFO_TXT('[INFO]')} src={src_ips}")
             print(f"  {INFO_TXT('[INFO]')} dst={dst_ips}")
             print(f"  {INFO_TXT('[INFO]')} ports={ports if ports else ['(any)']}")
-        else:
-            src_n = len(src_ips) if src_ips else 0
-            dst_n = len(dst_ips) if dst_ips else 0
-            svc   = (ports[0] if ports else '(any)')
-            print(f"  ingress={ingress_if or '(undetermined)'}; src={src_n} dst={dst_n} svc={svc}")
-
-        # Debug previews when resolution fails
-        if (not src_ips and rule.get('src')):
-            _debug_show_entity(rule['src'], label="SRC")
-        if (not dst_ips and rule.get('dst')):
-            _debug_show_entity(rule['dst'], label="DST")
-
-        if not src_ips or not dst_ips:
-            print(f"  [WARN] Skipping rule {rule['rule_id']} (no IPs resolved).")
-            continue
 
         run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if, log_dir)
 
+    print(f"\n\n{'='*70}")
+    print(f"Processing complete! Processed {processed}/{total_rules} rules")
+    print(f"{'='*70}\n")
+    
+    # Shadow detection (if enabled)
+    if SHADOW_DETECT_ENABLED:
+        print(f"\n{'='*70}")
+        print(f"SHADOW DETECTION ENABLED - Testing for ACL shadowing...")
+        print(f"{'='*70}\n")
+        detect_acl_shadowing(parsed_rules, log_dir)
+    
     _write_global_summaries()
+    _print_final_summary(start_time)
 
 def extract_rule_components_tokenized(line: str):
     """
     Token-based parser for 'advanced' ACL lines.
+    
     Captures: acl_name, rule_id, action, proto, src_if?, src, dst_if?, dst, service?
+    
+    Args:
+        line: ACL line from running-config
+    
+    Returns:
+        dict: Parsed rule components or None if parsing fails
     """
     rid_m = re.search(r"rule-id\s+(\d+)", line)
     rule_id = rid_m.group(1) if rid_m else "unknown"
@@ -428,7 +551,16 @@ def extract_rule_components_tokenized(line: str):
     }
 
 def parse_entity(toks, i):
-    """Parse one ACL address entity at toks[i]."""
+    """
+    Parse one ACL address entity at toks[i].
+    
+    Args:
+        toks: List of tokens from ACL line
+        i: Current index in token list
+    
+    Returns:
+        tuple: (entity_string, next_index)
+    """
     if i >= len(toks):
         return ("unknown", i)
     t = toks[i]
@@ -469,7 +601,9 @@ def resolve_objectish(identifier: str, role: str = ""):
     ident = identifier.strip()
 
     if ident in ("any", "any4", "any6"):
-        # Use RFC 2544 test net placeholders to keep paths deterministic per role
+        # Use RFC 2544 test net placeholders to keep paths deterministic per role.
+        # NOTE: These IPs may not work if the device lacks routes to 198.18.0.0/15.
+        # Set ACL_PT_DEFAULT_IF to specify a fallback ingress interface if needed.
         return ["198.18.0.10"] if role == "src" else ["198.18.0.20"]
 
     if ident.startswith("host "):
@@ -553,22 +687,7 @@ def resolve_service(service_token, proto_hint=None):
     """
     import re
     import socket
-
-    def _port_from_token(tok, ph="tcp"):
-        tok = str(tok).strip().lower()
-        if tok.isdigit():
-            try:
-                v = int(tok);  # 0..65535
-                return v if 0 <= v <= 65535 else None
-            except Exception:
-                return None
-        try:
-            return socket.getservbyname(tok, ph)
-        except Exception:
-            try:
-                return socket.getservbyname(tok)
-            except Exception:
-                return None
+    # Note: Uses module-level _port_from_token() function
 
     def _fetch_og(name):
         name = str(name).strip()
@@ -628,6 +747,9 @@ def resolve_service(service_token, proto_hint=None):
                     if first_only:
                         ports.append(ps)
                         return ports
+                    actual_range = pe - ps + 1
+                    if actual_range > 1000:
+                        print(f"  [WARN] Port range {ps}-{pe} ({actual_range} ports) in service group '{name}' is very large")
                     ports.extend(range(ps, pe + 1))
                 continue
 
@@ -661,8 +783,8 @@ def resolve_service(service_token, proto_hint=None):
         parts = [p for p in t.strip().split() if p]
         toks.extend(parts if parts else [t.strip()])
 
-    # Protocol hint
-    ph = (proto_hint or (rule.get("proto") if 'rule' in globals() else None) or "tcp").lower()
+    # Protocol hint - default to tcp if not provided
+    ph = (proto_hint or "tcp").lower()
 
     out_ports = []
     i = 0
@@ -724,7 +846,10 @@ def extract_ports_from_service_group_output(output: str):
             p1 = service_token_to_port(m.group(1))
             p2 = service_token_to_port(m.group(2))
             if p1 and p2 and 0 < p1 <= 65535 and 0 < p2 <= 65535 and p1 <= p2:
-                span = min(p2 - p1 + 1, 256)  # cap expansion to avoid explosions
+                actual_range = p2 - p1 + 1
+                span = min(actual_range, 256)  # cap expansion to avoid explosions
+                if actual_range > 256:
+                    print(f"  [WARN] Port range {p1}-{p2} ({actual_range} ports) truncated to first 256 ports for testing")
                 for p in range(p1, p1 + span):
                     ports.add(p)
             continue
@@ -749,8 +874,14 @@ def service_token_to_port(tok: str):
 # =========================
 def find_ingress_interface(ip: str) -> Optional[str]:
     """
-    Determine ingress interface for <ip>.
-    Only fall back to the default route if the device says '% Network not in table'.
+    Determine ingress interface for a given IP address by querying routing table.
+    Only falls back to the default route if the device says '% Network not in table'.
+    
+    Args:
+        ip: IP address to look up
+    
+    Returns:
+        str: Interface name or None if not determinable
     """
     out = get_and_parse_cli_output(f"show route {ip}")
 
@@ -769,7 +900,12 @@ def find_ingress_interface(ip: str) -> Optional[str]:
     if ifname and ifname.lower() != "interface":
         return ifname
 
-    # Do NOT auto-fallback to default route anymore
+    # If we couldn't parse an interface from the specific route, fall back to default route
+    ifname = get_default_route_interface()
+    if ifname:
+        return ifname
+    
+    # Final fallback to DEFAULT_INGRESS environment variable
     if DEFAULT_INGRESS:
         print(f"  [INFO] Using DEFAULT_INGRESS={DEFAULT_INGRESS} (set via env or script).")
         return DEFAULT_INGRESS
@@ -791,6 +927,7 @@ def get_default_route_interface() -> Optional[str]:
 def parse_route_for_interface(route_txt: str) -> Optional[str]:
     """
     Extract interface name from ASA/FTD 'show route' output.
+    
     Covers patterns like:
       * directly connected, via <IFNAME>
       * <nh>, from <peer>, via <IFNAME>
@@ -798,6 +935,12 @@ def parse_route_for_interface(route_txt: str) -> Optional[str]:
       interface is <IFNAME>
       is directly connected, <IFNAME> / connected, <IFNAME>
     Ignores the literal word 'interface' found in some parentheticals.
+    
+    Args:
+        route_txt: Output from 'show route' command
+    
+    Returns:
+        str: Interface name or None if not found
     """
     lines = route_txt.splitlines()
 
@@ -844,6 +987,15 @@ def parse_route_for_interface(route_txt: str) -> Optional[str]:
 # Packet-tracer result parsing
 # =========================
 def extract_pt_result(output: str) -> str:
+    """
+    Extract the final result (ALLOW/DENY/UNKNOWN) from packet-tracer output.
+    
+    Args:
+        output: Full packet-tracer command output
+    
+    Returns:
+        str: "ALLOW", "DENY", or "UNKNOWN"
+    """
     # Case-insensitive match for common summary fields
     m = re.search(r'(?im)^\s*(result|action|status)\s*:\s*([A-Z]+)\b', output)
     if m:
@@ -868,10 +1020,18 @@ RULE_REMARK_LINE_CACHE = {}
 
 def get_rule_remark_line(rule_id):
     """
-    Return the FULL ACL remark line for a rule-id, e.g.:
+    Return the FULL ACL remark line for a rule-id.
+    
+    Example:
       access-list CSM_FW_ACL_ remark rule-id 268444692: L7 RULE: F5 to TST MDX Health Check
+    
     Preference order: 'L7 RULE:' > 'ACCESS POLICY:' > first remark for that rule-id.
-    Returns None if nothing is found.
+    
+    Args:
+        rule_id: Rule ID to look up
+    
+    Returns:
+        str: Full remark line or None if not found
     """
     try:
         rid = str(rule_id).strip()
@@ -1028,10 +1188,18 @@ def map_ruleid_to_line(acl_name, rule_id):
 def determine_ace_match(rule, pt_output):
     """
     Decide if THIS rule matched based on packet-tracer output.
+    
+    Logic:
       1) Prefer a direct rule-id match in PT output.
       2) Else, if PT shows a line number, compare to our line for this rule-id.
       3) Otherwise, unknown.
-    Returns dict: {'matched': True/False/None, 'hit': <dict or None>, 'expected_line': <int or None>}
+    
+    Args:
+        rule: Parsed rule dict with 'acl_name' and 'rule_id'
+        pt_output: Full packet-tracer command output
+    
+    Returns:
+        dict: {'matched': True/False/None, 'hit': <dict or None>, 'expected_line': <int or None>}
     """
     hits = parse_pt_acl_hits(pt_output)
     if not hits:
@@ -1074,7 +1242,7 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
     executed = []  # rows for this rule only
     proto = (rule.get("proto") or "").lower()
     max_flag_print = int(os.environ.get("ACL_PT_MAX_FLAG_PRINT", "100"))
-    workers = int(os.environ.get("ACL_PT_WORKERS", "1"))
+    workers = ACL_PT_WORKERS  # Use global setting
 
     import re
     import concurrent.futures
@@ -1271,58 +1439,57 @@ def run_packet_tracer_tests(rule, src_ips, dst_ips, ports, ingress_if_unused, lo
                         print("  [DBG] packet-tracer preview (first 10 lines):")
                         print(preview)
 
-    # ---- Per-rule summary ----
+    # ---- Per-rule summary (only in verbose mode, data goes to CSV) ----
     if not executed:
-        print(f"\n[Summary for rule {rule['rule_id']}] (no tests)")
-        print("-" * 60)
         return
 
-    allow = sum(1 for r in executed if (r["result"] or "").upper() == "ALLOW")
-    deny  = sum(1 for r in executed if (r["result"] or "").upper() == "DENY")
-    unkn  = sum(1 for r in executed if (r["result"] or "").upper() == "UNKNOWN")
-    matched_allow = sum(1 for r in executed if (r["result"] or "").upper() == "ALLOW" and r.get("matched") is True)
-    other_allow   = allow - matched_allow
-    ingress_set = sorted(set(r["ingress"] for r in executed if r.get("ingress")))
-
-    ok = OK_TXT(str(matched_allow)) if matched_allow else "0"
-    y  = _c(str(other_allow), "33") if other_allow else "0"  # yellow
-    x  = DEN_TXT(str(deny)) if deny else "0"
-    q  = UNK_TXT(str(unkn)) if unkn else "0"
-
-    print(f"\n[Rule {rule['rule_id']} • {rule['proto']}] ingress={','.join(ingress_set)}"
-          f" → ✅ {ok} | 🟡 {y} | ⛔ {x} | ❓ {q}")
+    # Only print detailed summaries in verbose mode
     if _is_verbose():
+        allow = sum(1 for r in executed if (r["result"] or "").upper() == "ALLOW")
+        deny  = sum(1 for r in executed if (r["result"] or "").upper() == "DENY")
+        unkn  = sum(1 for r in executed if (r["result"] or "").upper() == "UNKNOWN")
+        matched_allow = sum(1 for r in executed if (r["result"] or "").upper() == "ALLOW" and r.get("matched") is True)
+        other_allow   = allow - matched_allow
+        ingress_set = sorted(set(r["ingress"] for r in executed if r.get("ingress")))
+
+        ok = OK_TXT(str(matched_allow)) if matched_allow else "0"
+        y  = _c(str(other_allow), "33") if other_allow else "0"  # yellow
+        x  = DEN_TXT(str(deny)) if deny else "0"
+        q  = UNK_TXT(str(unkn)) if unkn else "0"
+
+        print(f"\n[Rule {rule['rule_id']} • {rule['proto']}] ingress={','.join(ingress_set)}"
+              f" → ✅ {ok} | 🟡 {y} | ⛔ {x} | ❓ {q}")
         print(DIM(f"   acl={rule['acl_name']} srcs={len(src_ips or [])} dsts={len(dst_ips or [])}"))
 
-    # ---- Print flagged commands (non-✅ or allowed by different ACE) ----
-    flagged = [r for r in executed if ((r["result"] or "").upper() != "ALLOW") or (r.get("matched") is not True)]
-    if flagged:
-        print(DIM("   Flagged packet-tracers:"))
-        # Sort for stable-ish output: DENY first, then ALLOW-but-different, then others; tie-break by cmd
-        def _sev(r):
-            res = (r["result"] or "").upper()
-            if res == "DENY":
-                return 0
-            if res == "ALLOW" and r.get("matched") is not True:
-                return 1
-            return 2
-        flagged.sort(key=lambda r: (_sev(r), r["cmd"]))
-        for r in flagged[:max_flag_print]:
-            res = (r["result"] or "").upper()
-            matched = r.get("matched")
-            if res == "DENY" and matched is False:
-                icon = "⛔🟡"   # final DENY but ACL phase matched a DIFFERENT ACE
-            elif res == "DENY":
-                icon = "⛔"
-            elif res == "ALLOW" and matched is not True:
-                icon = "🟡"
-            else:
-                icon = "❓"
-            print(f"     {icon} {r['cmd']}  →  {r['label']}")
-        if len(flagged) > max_flag_print:
-            print(DIM(f"     …and {len(flagged)-max_flag_print} more flagged items (raise ACL_PT_MAX_FLAG_PRINT to see all)"))
+        # ---- Print flagged commands (non-✅ or allowed by different ACE) ----
+        flagged = [r for r in executed if ((r["result"] or "").upper() != "ALLOW") or (r.get("matched") is not True)]
+        if flagged:
+            print(DIM("   Flagged packet-tracers:"))
+            # Sort for stable-ish output: DENY first, then ALLOW-but-different, then others; tie-break by cmd
+            def _sev(r):
+                res = (r["result"] or "").upper()
+                if res == "DENY":
+                    return 0
+                if res == "ALLOW" and r.get("matched") is not True:
+                    return 1
+                return 2
+            flagged.sort(key=lambda r: (_sev(r), r["cmd"]))
+            for r in flagged[:max_flag_print]:
+                res = (r["result"] or "").upper()
+                matched = r.get("matched")
+                if res == "DENY" and matched is False:
+                    icon = "⛔🟡"   # final DENY but ACL phase matched a DIFFERENT ACE
+                elif res == "DENY":
+                    icon = "⛔"
+                elif res == "ALLOW" and matched is not True:
+                    icon = "🟡"
+                else:
+                    icon = "❓"
+                print(f"     {icon} {r['cmd']}  →  {r['label']}")
+            if len(flagged) > max_flag_print:
+                print(DIM(f"     …and {len(flagged)-max_flag_print} more flagged items (raise ACL_PT_MAX_FLAG_PRINT to see all)"))
 
-    print("-" * 60)
+        print("-" * 60)
 
 # =========================
 # Debug Helpers
@@ -1356,6 +1523,147 @@ def _debug_show_route(src_ips_subset):
         print(f"  [DBG] Route preview error: {e}")
 
 # =========================
+# Shadow Detection
+# =========================
+def detect_acl_shadowing(parsed_rules, log_dir):
+    """
+    Detect ACL shadowing by testing each rule's IPs against all earlier rules.
+    For each rule, test its source IPs with earlier rules to see if they would match first.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    
+    shadow_lock = threading.Lock()
+    total_tests = 0
+    completed_tests = 0
+    
+    # Count total tests
+    for i, rule in enumerate(parsed_rules):
+        if i > 0:  # Skip first rule (nothing to shadow it)
+            total_tests += len(rule['src_ips']) * i  # Test against all earlier rules
+    
+    print(f"Testing {len(parsed_rules)} rules for shadowing ({total_tests} tests)...")
+    
+    def test_shadow(current_rule_idx, current_rule, earlier_rule_idx, earlier_rule, test_ip):
+        """Test if test_ip from current_rule would match earlier_rule."""
+        nonlocal completed_tests
+        
+        # Get destination and port for testing
+        dst_ip = current_rule['dst_ips'][0] if current_rule['dst_ips'] else None
+        if not dst_ip:
+            return None
+        
+        proto = (current_rule.get("proto") or "").lower()
+        ports = current_rule['ports']
+        
+        # Determine port for test
+        if proto.startswith("icmp"):
+            dport = "8/0"
+        elif ports:
+            dport = ports[0]
+        elif proto == "tcp":
+            dport = DEFAULT_TCP_PORT
+        elif proto == "udp":
+            dport = DEFAULT_UDP_PORT
+        else:
+            dport = 0
+        
+        # Find ingress interface
+        ingress_if = current_rule.get("src_if")
+        if not ingress_if:
+            ingress_if = find_ingress_interface(test_ip)
+        
+        if not ingress_if:
+            return None
+        
+        # Build packet-tracer command
+        if proto.startswith("icmp"):
+            cmd = f"packet-tracer input {ingress_if} icmp {test_ip} 8 0 {dst_ip}"
+        else:
+            cmd = f"packet-tracer input {ingress_if} {proto} {test_ip} 12345 {dst_ip} {dport}"
+        
+        # Execute packet-tracer
+        out = get_and_parse_cli_output(cmd)
+        
+        # Check which rule matched
+        match_info = determine_ace_match(earlier_rule, out)
+        
+        with shadow_lock:
+            completed_tests += 1
+            if not _is_verbose():
+                print(f"Shadow detection: {completed_tests}/{total_tests} tests...", end="\r")
+        
+        # If the earlier rule matched, we found shadowing
+        if match_info.get("matched") is True:
+            current_name = get_rule_name(current_rule['rule_id']) or ""
+            earlier_name = get_rule_name(earlier_rule['rule_id']) or ""
+            
+            return {
+                'shadowed_rule_id': current_rule['rule_id'],
+                'shadowed_rule_name': current_name,
+                'shadowed_by_rule_id': earlier_rule['rule_id'],
+                'shadowed_by_rule_name': earlier_name,
+                'test_ip': test_ip,
+                'dst_ip': dst_ip,
+                'proto': proto,
+                'dport': dport,
+                'ingress': ingress_if,
+                'cmd': cmd,
+                'acl': current_rule['acl_name']
+            }
+        
+        return None
+    
+    # Run shadow detection tests
+    tasks = []
+    for i, current_rule in enumerate(parsed_rules):
+        if i == 0:
+            continue  # First rule can't be shadowed
+        
+        # Test this rule's IPs against all earlier rules
+        for test_ip in current_rule['src_ips']:
+            for j, earlier_rule in enumerate(parsed_rules[:i]):
+                tasks.append((i, current_rule, j, earlier_rule, test_ip))
+    
+    # Execute tests with threading
+    with ThreadPoolExecutor(max_workers=ACL_PT_WORKERS) as executor:
+        futures = [executor.submit(test_shadow, *task) for task in tasks]
+        
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                SHADOWING_RESULTS.append(result)
+    
+    print(f"\n\nShadow detection complete: {len(SHADOWING_RESULTS)} shadowing issues found")
+    
+    # Write shadowing CSV
+    if SHADOWING_RESULTS:
+        _write_shadowing_csv()
+
+def _write_shadowing_csv():
+    """Write shadowing results to CSV file."""
+    if not LOG_DIR_GLOBAL or not SHADOWING_RESULTS:
+        return
+    
+    try:
+        import csv
+        shadow_path = os.path.join(LOG_DIR_GLOBAL, "results_shadowing.csv")
+        with open(shadow_path, "w", newline="") as f:
+            fieldnames = [
+                "acl", "shadowed_rule_id", "shadowed_rule_name", 
+                "shadowed_by_rule_id", "shadowed_by_rule_name",
+                "test_ip", "dst_ip", "proto", "dport", "ingress", "cmd"
+            ]
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for row in SHADOWING_RESULTS:
+                w.writerow(row)
+        print(f"✅ Shadowing results written to: {shadow_path}")
+        print(f"   ({len(SHADOWING_RESULTS)} shadowing issues detected)")
+    except Exception as e:
+        print(f"[ERROR] Shadowing CSV write error: {e}")
+
+# =========================
 # Logging summaries
 # =========================
 def _write_rule_log(rule_id, cmd, result, out, log_dir):
@@ -1367,32 +1675,139 @@ def _write_rule_log(rule_id, cmd, result, out, log_dir):
 
 
 def _write_global_summaries():
-    # No-op unless logging is enabled
-    if not LOG_ENABLED or not LOG_DIR_GLOBAL or not RESULTS:
+    # Always write CSV (detailed logs only when LOG_ENABLED)
+    if not LOG_DIR_GLOBAL or not RESULTS:
         return
+    
     try:
         import csv
-        csv_path = os.path.join(LOG_DIR_GLOBAL, "summary.csv")
+        fieldnames = [
+            "acl","rule_id","rule_name","proto","src","dst","dport","ingress","result","matched","label","cmd"
+        ]
+        
+        # Add rule names to all rows
+        for row in RESULTS:
+            if "rule_name" not in row:
+                row["rule_name"] = get_rule_name(row.get("rule_id")) or ""
+        
+        # 1. Complete results CSV
+        csv_path = os.path.join(LOG_DIR_GLOBAL, "results.csv")
         with open(csv_path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=[
-                "acl","rule_id","proto","src","dst","dport","ingress","result","matched","label"
-            ])
+            w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
             for row in RESULTS:
                 w.writerow(row)
-        print(DIM(f"Summary CSV: {csv_path}"))
+        print(f"\n✅ Complete results written to: {csv_path}")
+        
+        # 2. Flagged results CSV (did not match expected ACE)
+        flagged_results = [r for r in RESULTS if r.get("matched") is not True]
+        if flagged_results:
+            flagged_path = os.path.join(LOG_DIR_GLOBAL, "results_flagged.csv")
+            with open(flagged_path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                for row in flagged_results:
+                    w.writerow(row)
+            print(f"✅ Flagged results (non-matching) written to: {flagged_path}")
+            print(f"   ({len(flagged_results)} of {len(RESULTS)} tests did not match expected ACE)")
+        else:
+            print(f"✅ No flagged results - all tests matched expected ACE!")
+            
     except Exception as e:
-        _dbg(f"[DBG] CSV write error: {e}")
+        print(f"[ERROR] CSV write error: {e}")
 
-    try:
-        import json
-        j_path = os.path.join(LOG_DIR_GLOBAL, "summary.jsonl")
-        with open(j_path, "w") as f:
-            for row in RESULTS:
-                f.write(json.dumps(row) + "\n")
-        print(DIM(f"Summary JSONL: {j_path}"))
-    except Exception as e:
-        _dbg(f"[DBG] JSONL write error: {e}")
+    # JSONL only when detailed logging is enabled
+    if LOG_ENABLED:
+        try:
+            import json
+            j_path = os.path.join(LOG_DIR_GLOBAL, "results.jsonl")
+            with open(j_path, "w") as f:
+                for row in RESULTS:
+                    f.write(json.dumps(row) + "\n")
+            print(f"✅ JSONL written to: {j_path}")
+        except Exception as e:
+            _dbg(f"[DBG] JSONL write error: {e}")
+
+
+def _print_final_summary(start_time):
+    """Print aggregate statistics from all packet-tracer tests."""
+    import time
+    
+    if not RESULTS:
+        print("No results to summarize.")
+        return
+    
+    elapsed_seconds = time.time() - start_time
+    
+    # Format elapsed time
+    if elapsed_seconds < 60:
+        time_str = f"{elapsed_seconds:.1f} seconds"
+    elif elapsed_seconds < 3600:
+        minutes = int(elapsed_seconds // 60)
+        seconds = int(elapsed_seconds % 60)
+        time_str = f"{minutes}m {seconds}s"
+    else:
+        hours = int(elapsed_seconds // 3600)
+        minutes = int((elapsed_seconds % 3600) // 60)
+        time_str = f"{hours}h {minutes}m"
+    
+    total = len(RESULTS)
+    allow = sum(1 for r in RESULTS if (r.get("result") or "").upper() == "ALLOW")
+    deny = sum(1 for r in RESULTS if (r.get("result") or "").upper() == "DENY")
+    unknown = sum(1 for r in RESULTS if (r.get("result") or "").upper() == "UNKNOWN")
+    
+    matched_this = sum(1 for r in RESULTS if r.get("matched") is True)
+    matched_other = sum(1 for r in RESULTS if r.get("matched") is False)
+    matched_unknown = sum(1 for r in RESULTS if r.get("matched") is None)
+    
+    unique_rules = len(set(r.get("rule_id") for r in RESULTS if r.get("rule_id")))
+    
+    # Calculate throughput
+    tests_per_second = total / elapsed_seconds if elapsed_seconds > 0 else 0
+    
+    print(f"{'='*70}")
+    print(f"SUMMARY STATISTICS")
+    print(f"{'='*70}")
+    print(f"Execution time:            {time_str}")
+    print(f"Throughput:                {tests_per_second:.1f} tests/second")
+    print(f"Total packet-tracer tests: {total}")
+    print(f"Unique ACL rules tested:   {unique_rules}")
+    print(f"")
+    print(f"Results breakdown:")
+    print(f"  {OK_TXT('✅ ALLOW')}:   {allow:5d} ({100*allow/total if total else 0:.1f}%)")
+    print(f"  {DEN_TXT('⛔ DENY')}:    {deny:5d} ({100*deny/total if total else 0:.1f}%)")
+    print(f"  {UNK_TXT('❓ UNKNOWN')}: {unknown:5d} ({100*unknown/total if total else 0:.1f}%)")
+    print(f"")
+    print(f"ACE matching:")
+    print(f"  Matched expected rule:  {matched_this:5d} ({100*matched_this/total if total else 0:.1f}%)")
+    print(f"  Matched different rule: {matched_other:5d} ({100*matched_other/total if total else 0:.1f}%)")
+    print(f"  Match undetermined:     {matched_unknown:5d} ({100*matched_unknown/total if total else 0:.1f}%)")
+    print(f"{'='*70}")
+    
+    # Highlight issues
+    issues = []
+    if deny > 0:
+        issues.append(f"{deny} DENY results")
+    if matched_other > 0:
+        issues.append(f"{matched_other} matched different rules")
+    if unknown > 0:
+        issues.append(f"{unknown} UNKNOWN results")
+    
+    if issues:
+        print(f"\n⚠️  Issues found: {', '.join(issues)}")
+        print(f"Review flagged results: {os.path.join(LOG_DIR_GLOBAL, 'results_flagged.csv')}")
+        print(f"Complete results:       {os.path.join(LOG_DIR_GLOBAL, 'results.csv')}")
+    else:
+        print(f"\n✅ All tests passed! All traffic allowed by expected rules.")
+    
+    # Shadowing summary
+    if SHADOW_DETECT_ENABLED and SHADOWING_RESULTS:
+        print(f"\n⚠️  ACL Shadowing detected: {len(SHADOWING_RESULTS)} issues")
+        print(f"Review shadowing report: {os.path.join(LOG_DIR_GLOBAL, 'results_shadowing.csv')}")
+    elif SHADOW_DETECT_ENABLED:
+        print(f"\n✅ No ACL shadowing detected")
+    
+    print(f"{'='*70}\n")
 
 
 # =========================
