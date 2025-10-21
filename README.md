@@ -33,7 +33,9 @@ It then reports:
 ### 📊 CSV Output (Always Enabled)
 - **results.csv**: Complete test results with rule names and details
 - **results_flagged.csv**: Only tests that didn't match expected ACE (for quick issue review)
+- **by_matched_rule/**: Per-rule CSVs grouped by which rule was actually matched (for focused troubleshooting)
 - **results_shadowing.csv**: ACL shadowing detection report (when enabled)
+- **ZIP archive**: All output files automatically compressed for easy sharing
 - Easy to import into Excel, databases, or analysis tools
 
 ### ⚙️ Multi-Threaded Testing
@@ -292,12 +294,18 @@ A timestamped directory is created for each run, for example:
 
 ```text
 /var/tmp/acl_packet_tracer_YYYYMMDD_HHMMSS/
-  ├─ results.csv                  # ALL test results (always created)
-  ├─ results_flagged.csv          # Non-matching tests only (always created)
-  ├─ results_shadowing.csv        # Shadowing issues (when ACL_PT_SHADOW_DETECT=1)
-  ├─ results.jsonl                # JSON format (when ACL_PT_LOG=1)
-  ├─ rule_268436574.log           # Per-rule packet-tracer output (when ACL_PT_LOG=1)
+  ├─ results.csv                           # ALL test results (always created)
+  ├─ results_flagged.csv                   # Non-matching tests only (always created)
+  ├─ by_matched_rule/                      # Per-matched-rule CSVs (always created)
+  │   ├─ matched_by_268436500_Default_Rule.csv
+  │   ├─ matched_by_268436450_Broader_Range.csv
+  │   └─ matched_by_unknown_Unknown_or_Denied.csv
+  ├─ results_shadowing.csv                 # Shadowing issues (when ACL_PT_SHADOW_DETECT=1)
+  ├─ results.jsonl                         # JSON format (when ACL_PT_LOG=1)
+  ├─ rule_268436574.log                    # Per-rule packet-tracer output (when ACL_PT_LOG=1)
   └─ rule_268436996.log
+
+/var/tmp/acl_packet_tracer_YYYYMMDD_HHMMSS.zip  # Compressed archive (always created)
 ```
 
 ### 📊 CSV Fields
