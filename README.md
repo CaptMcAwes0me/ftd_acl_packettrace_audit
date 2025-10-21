@@ -3,9 +3,12 @@
 Audit Cisco FTD ACLs by auto-expanding objects and running `packet-tracer` tests per rule.  
 The script parses each access-list line, resolves object/object-group members, determines the correct ingress interface per source IP via routing lookups, and executes representative `packet-tracer` commands.
 
+**Results are automatically saved to CSV files for easy analysis and reporting.**
+
 It then reports:
 - Whether traffic was **allowed / denied / unknown**
 - Whether it was **allowed by this exact ACE (✅)** or by a **different ACE (🟡)**, using `rule-id` lines from `packet-tracer` output.
+- **ACL shadowing issues** (optional) - detects when rules are shadowed by earlier rules
 
 > ⚠️ **Read-only:** This tool only runs `show` and `packet-tracer` commands — it never modifies configuration.
 
@@ -27,14 +30,22 @@ It then reports:
 
 ## ✨ Features
 
+### 📊 CSV Output (Always Enabled)
+- **results.csv**: Complete test results with rule names and details
+- **results_flagged.csv**: Only tests that didn't match expected ACE (for quick issue review)
+- **results_shadowing.csv**: ACL shadowing detection report (when enabled)
+- Easy to import into Excel, databases, or analysis tools
+
 ### ⚙️ Multi-Threaded Testing
-- Parallel packet-tracer execution with the ACL_PT_WORKERS variable (default: 8).
+- Parallel packet-tracer execution with the ACL_PT_WORKERS variable (default: 16).
 - Thread-safe logging and shared route cache for performance.
+- Configurable worker count for optimal performance on your system.
 
 ### 🧭 Dynamic Ingress Detection
 - Uses show route <src_ip> to identify ingress interfaces.
-- Falls back to default route only when % Network not in table.
+- Falls back to default route when route lookup fails or returns unparseable results.
 - Optional static fallback via ACL_PT_DEFAULT_IF.
+- Cached route lookups for improved performance.
 
 ### 🧩 Full Object Expansion
 - Recursively expands network and service object-groups, including nested groups.
@@ -52,14 +63,27 @@ It then reports:
 - matched this ACE • by <ACL> rule-id <id> '<name>' • [drop-reason].
 
 ### 🧾 Structured Artifacts
-- Per-rule logs: rule_<id>.log
-- Summary CSV and JSONL with every probe result.
+- **CSV files (always created)**: Complete results, flagged results, and shadowing report
+- Per-rule logs: rule_<id>.log (when ACL_PT_LOG=1)
+- JSONL format with every probe result (when ACL_PT_LOG=1)
 - Timestamped run directory for each execution.
 
+### 🔍 Shadow Detection (Optional)
+- Detects ACL rule shadowing by testing each rule's IPs against earlier rules
+- Identifies when specific rules are shadowed by broader rules
+- Finds partially shadowed rules that may cause unexpected behavior
+- Enable with ACL_PT_SHADOW_DETECT=1
+
+### ⏱️ Performance Metrics
+- Execution time tracking with human-readable format
+- Throughput statistics (tests per second)
+- Progress indicators during parsing and testing phases
+
 ### 🧰 Flexible Output Modes
-- summary (default) – concise per-rule summary.
-- verbose – prints every packet-tracer command and outcome.
-- debug – adds previews of object, route, and parsing stages.
+- **summary (default)** – Clean progress indicators with final statistics
+- **verbose** – Prints every packet-tracer command and outcome
+- **debug** – Adds previews of object, route, and parsing stages
+- Minimal console output with comprehensive CSV reporting
 
 ### 🚦 Per-Rule Summary with Icons
 - ✅ **ALLOW (matched this ACE)**
@@ -67,26 +91,11 @@ It then reports:
 - ⛔ **DENY** — the packet-tracer’s final **Action** was *drop*. This can be an ACL decision (explicit deny or default rule) or another control (prefilter/security policy, NAT/routing, inspection/state, zone/interface). When available, the script shows the denying ACE (`rule-id`); otherwise check the `Drop-reason:` in the output.
 - ❓ **UNKNOWN (no clear result parsed)**
 
-### 🧭 Per-Source Ingress Detection
-Uses `show route <src_ip>`; falls back to the default route only when `% Network not in table`.
-
-### 🧩 Object Expansion
-- Expands network and service object-groups (supports nested groups).
-- Resolves named ports and ranges (`http`, `https`, etc.).
-
 ### 🧪 Sensible Sampling
 - **ICMP:** `echo-request` (type 8, code 0) using order `src type code dst`.
-- **TCP/UDP:** Tests only the first port from large groups by default (toggleable).
-- **Service any:** Uses representative defaults (`80` for TCP, `53` for UDP).
-
-### 🧾 Artifacts
-- Per-ACE logs: `/var/log/acl_packet_tracer_<timestamp>/rule_<id>.log`
-- `summary.csv` and `summary.jsonl` with structured results
-
-### 🧰 Output Modes
-- `summary` (default)
-- `verbose`
-- `debug`
+- **TCP/UDP:** Tests representative ports from service groups
+- **Service any:** Uses configurable defaults (80 for TCP, 53 for UDP via env vars)
+- Warnings when port ranges are truncated for testing
 
 ### 🎨 Optional ANSI Colors
 Disable with:
@@ -133,18 +142,22 @@ which ConvergedCliClient
 
 You can control verbosity, color, and limits using environment variables.
 
-### 🧩 Basic Run
+### 🧩 Basic Run (CSV output always created)
 ```bash
 python3 ftd_acl_packettrace_audit.py
 ```
+Output:
+- `/var/tmp/acl_packet_tracer_YYYYMMDD_HHMMSS/results.csv`
+- `/var/tmp/acl_packet_tracer_YYYYMMDD_HHMMSS/results_flagged.csv`
 
 ### 🗣️ Verbose / Debug Modes
 Show each `packet-tracer` command and result:
 ```bash
 ACL_PT_PRINT_MODE=verbose python3 ftd_acl_packettrace_audit.py
 ```
-### 📝 Enable Logging (opt-in)
-Write per-ACE logs + CSV/JSONL to /var/tmp:
+
+### 📝 Enable Detailed Logging (opt-in)
+Write per-ACE logs + JSONL to /var/tmp:
 ```bash
 ACL_PT_LOG=1 python3 ftd_acl_packettrace_audit.py
 ```
@@ -155,6 +168,29 @@ ACL_PT_LOG=1 ACL_PT_LOG_DIR=/var/tmp/ftd_audit_runs python3 ftd_acl_packettrace_
 Include `[DBG]` previews (routes, objects, etc.):
 ```bash
 ACL_PT_PRINT_MODE=debug python3 ftd_acl_packettrace_audit.py
+```
+
+### 🚀 Performance Tuning
+Increase concurrent packet-tracer threads (default: 16):
+```bash
+ACL_PT_WORKERS=32 python3 ftd_acl_packettrace_audit.py
+```
+Recommendations:
+- **16 workers** (default): Good for most systems
+- **24-32 workers**: High-performance systems
+- **8 workers**: Conservative, if experiencing timeouts
+
+### 🔍 Shadow Detection (Comprehensive ACL Analysis)
+Detect ACL rule shadowing:
+```bash
+ACL_PT_SHADOW_DETECT=1 python3 ftd_acl_packettrace_audit.py
+```
+This tests each rule's IPs against all earlier rules to find shadowing issues.
+**Note:** Significantly increases execution time (O(n²) complexity).
+
+Combine with performance tuning:
+```bash
+ACL_PT_SHADOW_DETECT=1 ACL_PT_WORKERS=32 python3 ftd_acl_packettrace_audit.py
 ```
 
 ### 🎨 Disable Color
@@ -175,9 +211,15 @@ export ACL_PT_DEFAULT_IF=Your-Ingress-Interface
 python3 ftd_acl_packettrace_audit.py
 ```
 
-> 💡 Combine options for quick testing:
+### 🎛️ Configure Default Test Ports
+Customize default ports for "any" service:
+```bash
+ACL_PT_DEFAULT_TCP_PORT=443 ACL_PT_DEFAULT_UDP_PORT=161 python3 ftd_acl_packettrace_audit.py
+```
+
+> 💡 Combine options for comprehensive audits:
 > ```bash
-> ACL_PT_COLOR=0 ACL_PT_PRINT_MODE=verbose python3 ftd_acl_packettrace_audit.py
+> ACL_PT_SHADOW_DETECT=1 ACL_PT_WORKERS=32 ACL_PT_LOG=1 python3 ftd_acl_packettrace_audit.py
 > ```
 
 ---
@@ -186,15 +228,52 @@ python3 ftd_acl_packettrace_audit.py
 
 ### 🧾 Example Summary Output
 ```text
-Processing rule:
-access-list CSM_FW_ACL_ advanced permit tcp object-group ... rule-id 268436574
-  ingress=PRD-CORPTEST-BE_VLAN_333; src=18 dst=15 svc=22
+======================================================================
+FTD ACL Packet-Tracer Audit
+======================================================================
+Output directory: /var/tmp/acl_packet_tracer_20251021_110700
+Results CSV: /var/tmp/acl_packet_tracer_20251021_110700/results.csv
+Worker threads: 16 (set ACL_PT_WORKERS to adjust)
+======================================================================
 
-[Rule 268436574 • tcp] ingress=PRD-CORPTEST-BE_VLAN_333 → ✅ 12 | 🟡 3 | ⛔ 1 | ❓ 0
-   Flagged packet-tracers:
-     🟡 packet-tracer input PRD-CORPTEST-BE_VLAN_333 tcp 10.1.43.154 12345 10.1.50.59 22  →  ALLOW (by rule-id 268436000)
-     ⛔ packet-tracer input PRD-CORPTEST-BE_VLAN_333 tcp 10.1.43.200 12345 10.1.50.59 22  →  DENY
-------------------------------------------------------------
+Parsing and resolving 150 ACL rules...
+Parsed 145 valid rules (skipped 5)
+
+[1/145] Rule 268436573: MGMT Access to Firewalls...
+[2/145] Rule 268436574: Web Server Access...
+...
+
+======================================================================
+Processing complete! Processed 145/145 rules
+======================================================================
+
+✅ Complete results written to: /var/tmp/.../results.csv
+✅ Flagged results (non-matching) written to: /var/tmp/.../results_flagged.csv
+   (23 of 1250 tests did not match expected ACE)
+
+======================================================================
+SUMMARY STATISTICS
+======================================================================
+Execution time:            3m 45s
+Throughput:                5.6 tests/second
+Total packet-tracer tests: 1250
+Unique ACL rules tested:   145
+
+Results breakdown:
+  ✅ ALLOW:   1180 (94.4%)
+  ⛔ DENY:      65 (5.2%)
+  ❓ UNKNOWN:    5 (0.4%)
+
+ACE matching:
+  Matched expected rule:  1227 (98.2%)
+  Matched different rule:   18 (1.4%)
+  Match undetermined:        5 (0.4%)
+======================================================================
+
+⚠️  Issues found: 65 DENY results, 18 matched different rules
+Review flagged results: /var/tmp/.../results_flagged.csv
+Complete results:       /var/tmp/.../results.csv
+======================================================================
 ```
 
 ### 🔣 Icon Meanings
@@ -212,16 +291,26 @@ When anything other than ✅ occurs, the script prints the exact `packet-tracer`
 A timestamped directory is created for each run, for example:
 
 ```text
-/var/log/acl_packet_tracer_YYYYMMDD_HHMMSS/
-  ├─ rule_268436574.log       # raw packet-tracer output + command
-  ├─ rule_268436996.log
-  ├─ summary.csv              # structured results
-  └─ summary.jsonl            # one JSON object per line
+/var/tmp/acl_packet_tracer_YYYYMMDD_HHMMSS/
+  ├─ results.csv                  # ALL test results (always created)
+  ├─ results_flagged.csv          # Non-matching tests only (always created)
+  ├─ results_shadowing.csv        # Shadowing issues (when ACL_PT_SHADOW_DETECT=1)
+  ├─ results.jsonl                # JSON format (when ACL_PT_LOG=1)
+  ├─ rule_268436574.log           # Per-rule packet-tracer output (when ACL_PT_LOG=1)
+  └─ rule_268436996.log
 ```
 
-### 📊 CSV / JSON Fields
+### 📊 CSV Fields
+
+**results.csv & results_flagged.csv:**
 ```text
-acl, rule_id, proto, src, dst, dport, ingress, result, matched, label
+acl, rule_id, rule_name, proto, src, dst, dport, ingress, result, matched, label, cmd
+```
+
+**results_shadowing.csv:**
+```text
+acl, shadowed_rule_id, shadowed_rule_name, shadowed_by_rule_id, shadowed_by_rule_name,
+test_ip, dst_ip, proto, dport, ingress, cmd
 ```
 
 ---
@@ -238,11 +327,16 @@ TEST_FIRST_PORT_ONLY = True  # set to False to test all resolved ports
 
 | Variable | Values | Default | Description |
 |-----------|---------|----------|-------------|
+| `ACL_PT_WORKERS` | integer | 16 | Number of concurrent packet-tracer threads |
+| `ACL_PT_SHADOW_DETECT` | 1 or 0 | 0 | Enable ACL shadowing detection (slower) |
 | `ACL_PT_PRINT_MODE` | summary \| verbose \| debug | summary | Console verbosity |
 | `ACL_PT_COLOR` | 1 or 0 | 1 | Enable/disable ANSI colors |
 | `ACL_PT_MAX_FLAG_PRINT` | integer | 100 | Limit flagged lines printed per rule |
 | `ACL_PT_DEFAULT_IF` | string (ifname) | *(empty)* | Fallback ingress if route parsing fails |
-| `ACL_PT_LOG` | 1 or 0 | 0 | Write per-ACE logs + CSV/JSONL to /var/tmp |
+| `ACL_PT_DEFAULT_TCP_PORT` | integer | 80 | Default port for TCP "any" service |
+| `ACL_PT_DEFAULT_UDP_PORT` | integer | 53 | Default port for UDP "any" service |
+| `ACL_PT_LOG` | 1 or 0 | 0 | Write per-ACE logs + JSONL (CSV always created) |
+| `ACL_PT_LOG_DIR` | path | /var/tmp | Base directory for output files |
 
 ---
 
@@ -288,12 +382,16 @@ packet-tracer input <if> <proto> <src> 12345 <dst> <dport>
 
 ## 🛠️ Troubleshooting
 
-- **No output:** Ensure `ConvergedCliClient` is callable, you’re in expert shell, and Python 3 is installed.  
+- **No output:** Ensure `ConvergedCliClient` is callable, you're in expert shell, and Python 3 is installed.  
+- **Script appears frozen:** Check if it's parsing rules (should show progress). Large ACLs with many object-groups can take time to resolve.
 - **Ingress names look odd:** Parser ignores literal word `interface` and prefers `via <IF>` lines.  
   If you still see unexpected names, capture `show route <src_ip>` and open an issue with the snippet.  
-- **Default route overused:** Default route is used only when `% Network not in table` appears.  
+- **Default route being used:** Default route is now used when route lookup fails or returns unparseable results.
 - **ICMP syntax errors:** Ensure order `src type code dst`; script uses `8 0` (echo-request).  
 - **Too many flagged prints:** Reduce `ACL_PT_MAX_FLAG_PRINT` or switch to summary mode.
+- **Timeouts occurring:** Reduce `ACL_PT_WORKERS` to 8 or lower to decrease system load.
+- **Shadow detection too slow:** This is expected (O(n²) complexity). Use only for periodic comprehensive audits.
+- **CSV files not created:** Check permissions on `/var/tmp` or set `ACL_PT_LOG_DIR` to a writable location.
 
 ---
 
